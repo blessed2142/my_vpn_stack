@@ -24,10 +24,13 @@ cd /opt/vpnstack
 ./install.sh --domain vpn.example.com --email you@example.com --client main
 ```
 
-Домен нужен только для Hysteria 2 (настоящий сертификат Let's Encrypt).
-Заранее создайте **A-запись** `vpn.example.com → IPv4 сервера` (и `AAAA` на IPv6,
-если он есть). Если домена нет или DNS ещё не разошёлся — скрипт сам возьмёт
-самоподписанный сертификат и добавит `insecure=1` в ссылку; переключиться потом:
+Домен нужен **только для Hysteria 2** (настоящий сертификат Let's Encrypt).
+VLESS REALITY маскируется под чужой сайт, AmneziaWG работает по IP — им домен не нужен.
+Поддомен заводить необязательно, апекс подходит: `--domain example.com`.
+
+Нужна **A-запись** `example.com → IPv4 сервера` (и `AAAA` на IPv6, если он есть).
+Если DNS смотрит в другое место — скрипт возьмёт самоподписанный сертификат и
+добавит `insecure=1` в ссылку; переключиться потом:
 
 ```bash
 vpnctl tls-acme vpn.example.com you@example.com
@@ -38,6 +41,25 @@ vpnctl tls-acme vpn.example.com you@example.com
 ```bash
 ./install.sh --client main
 ```
+
+### Если Hysteria 2 уже настроена руками
+
+Установщик её не тронет, если передать `--keep-hysteria`: он прочитает порт из
+вашего `/etc/hysteria/config.yaml`, откроет его в firewall и поставит только
+VLESS и AmneziaWG. Управление пользователями Hysteria останется за вами.
+
+```bash
+./install.sh --keep-hysteria --client main
+```
+
+Если же хотите отдать Hysteria под `vpnctl`, запускайте без этого флага: старый
+конфиг сохранится рядом как `config.yaml.manual-<дата>`, а логины и пароли
+сгенерируются новые (ссылки придётся раздать заново — скрипт об этом предупредит).
+
+Уже есть сертификат от certbot? Установщик сам найдёт
+`/etc/letsencrypt/live/<домен>/` и переиспользует его, добавив deploy-hook на
+обновление после продления — повторно гонять ACME не будет. Свой сертификат из
+другого места указывается явно: `--hy2-cert /path/cert.pem --hy2-key /path/key.pem`.
 
 В конце установки скрипт напечатает ссылки и QR-коды для первого клиента.
 
@@ -75,6 +97,9 @@ vpnctl tls-acme <домен> <email>   перевести Hysteria2 на Let's E
 --awg-port <порт>       UDP-порт AmneziaWG (51820)
 --client <имя>          имя первого клиента (main)
 --only base,xray,hysteria,awg   поставить только часть
+--keep-hysteria         не трогать уже настроенную вручную Hysteria
+--hy2-cert / --hy2-key  свой TLS-сертификат для Hysteria2
+--hy2-insecure          пометить его как непроверяемый (insecure=1 в ссылке)
 --no-hy2-obfs           выключить Salamander
 --no-ipv6               не выдавать IPv6 внутри туннеля
 --no-firewall           не трогать nftables
@@ -93,6 +118,8 @@ vpnctl tls-acme <домен> <email>   перевести Hysteria2 на Let's E
 * nftables: политика `drop` на входе, открыты только SSH (порт берётся из
   `sshd_config`), 80/tcp для ACME и три VPN-порта; NAT/masquerade и MSS-clamp
   для AmneziaWG; IPv6 внутри туннеля через ULA-префикс.
+* Перед установкой проверяет, не занят ли нужный порт посторонним процессом,
+  и останавливается с понятным сообщением, а не падает молча.
 * Xray блокирует приватные диапазоны (клиент не попадёт в LAN сервера) и
   BitTorrent (чтобы не собрать abuse-жалобы). Отключается `--no-torrent-block`.
 

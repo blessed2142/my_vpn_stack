@@ -44,7 +44,7 @@ cmd_add() {
 
     local uuid hy2p priv pub psk idx ip4 ip6
     uuid=$( [ -n "${REALITY_PRIVATE_KEY:-}" ] && (have xray && xray uuid || cat /proc/sys/kernel/random/uuid) || echo "" )
-    hy2p=$( [ -n "${HY2_PORT:-}" ] && rand_pass || echo "" )
+    hy2p=$( [ -n "${HY2_PORT:-}" ] && [ "${HY2_MANAGED:-1}" = "1" ] && rand_pass || echo "" )
     if [ -n "${AWG_PUBLIC_KEY:-}" ]; then
         priv=$(awg genkey); pub=$(printf '%s' "$priv" | awg pubkey); psk=$(awg genpsk)
         idx=$(next_awg_index)
@@ -120,7 +120,8 @@ cmd_info() {
     public key      : ${REALITY_PUBLIC_KEY:-?}
     short id        : ${REALITY_SHORT_ID:-?}
 
-  Hysteria2         : UDP ${HY2_PORT:-?}   TLS: ${HY2_TLS_MODE:-?}   SNI: ${HY2_SNI:-?}
+  Hysteria2         : UDP ${HY2_PORT:-?}   TLS: ${HY2_TLS_MODE:-не под управлением vpnctl}   SNI: ${HY2_SNI:-?}
+    управление      : $( [ "${HY2_MANAGED:-1}" = "1" ] && echo "vpnctl" || echo "ваше ручное (--keep-hysteria)" )
     obfs salamander : ${HY2_OBFS_PASS:+включена}${HY2_OBFS_PASS:-выключена}
 
   AmneziaWG         : UDP ${AWG_PORT:-?}   режим: $( [ "${AWG_USE_KERNEL:-0}" = 1 ] && echo ядро || echo userspace )

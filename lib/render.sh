@@ -67,12 +67,20 @@ render_xray() {
 # ----------------------------------------------------------------- Hysteria2
 render_hysteria() {
     [ -n "${HY2_PORT:-}" ] || { warn "Hysteria2 не настроена — пропускаю рендер."; return 0; }
+    if [ "${HY2_MANAGED:-1}" != "1" ]; then
+        log "Hysteria2 под вашим ручным управлением — конфиг не трогаю."
+        return 0
+    fi
     mkdir -p "$(dirname "$HY2_CONF")"
     {
         echo "# Сгенерировано vpnstack — руками не править, используйте vpnctl."
         echo "listen: :${HY2_PORT}"
         echo
-        if [ "${HY2_TLS_MODE:-selfsigned}" = "acme" ]; then
+        if [ "${HY2_TLS_MODE:-selfsigned}" = "custom" ]; then
+            echo "tls:"
+            echo "  cert: ${HY2_CERT}"
+            echo "  key: ${HY2_KEY}"
+        elif [ "${HY2_TLS_MODE:-selfsigned}" = "acme" ]; then
             echo "acme:"
             echo "  domains:"
             echo "    - ${HY2_DOMAIN}"

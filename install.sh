@@ -25,14 +25,19 @@ cat <<USAGE
   --awg-port <порт>       UDP-порт AmneziaWG (51820)
   --client <имя>          имя первого клиента (по умолчанию: main)
   --only <список>         ставить только часть: base,xray,hysteria,awg (через запятую)
+  --keep-hysteria         не трогать уже настроенную вручную Hysteria (порт возьмётся из её конфига)
+  --hy2-cert <путь>       использовать свой TLS-сертификат для Hysteria2
+  --hy2-key <путь>        ключ к нему
+  --hy2-insecure          пометить сертификат как непроверяемый (insecure=1 в ссылке)
   --no-hy2-obfs           выключить обфускацию Salamander у Hysteria2
   --no-ipv6               не выдавать клиентам IPv6 внутри туннеля
   --no-firewall           не трогать nftables
   --no-torrent-block      не блокировать BitTorrent в VLESS
   -h, --help              эта справка
 
-Пример:
-  ./install.sh --domain vpn.example.com --email me@example.com --client phone
+Примеры:
+  ./install.sh --domain example.com --email me@example.com --client phone
+  ./install.sh --keep-hysteria --client phone      # Hysteria уже стоит, ставим только VLESS и AmneziaWG
 USAGE
 }
 
@@ -41,6 +46,7 @@ DOMAIN=""; EMAIL=""; ENDPOINT_ARG=""; SNI_ARG=""
 VLESS_PORT_ARG=443; HY2_PORT_ARG=443; AWG_PORT_ARG=51820
 FIRST_CLIENT="main"; ONLY="base,xray,hysteria,awg"
 HY2_OBFS_ARG=1; IPV6_ARG=1; FW_ARG=1; BT_ARG=1
+KEEP_HY2=0; HY2_CERT_ARG=""; HY2_KEY_ARG=""; HY2_INSECURE_ARG=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -53,6 +59,10 @@ while [ $# -gt 0 ]; do
         --awg-port) AWG_PORT_ARG="$2"; shift 2 ;;
         --client) FIRST_CLIENT="$2"; shift 2 ;;
         --only) ONLY="$2"; shift 2 ;;
+        --keep-hysteria) KEEP_HY2=1; shift ;;
+        --hy2-cert) HY2_CERT_ARG="$2"; shift 2 ;;
+        --hy2-key) HY2_KEY_ARG="$2"; shift 2 ;;
+        --hy2-insecure) HY2_INSECURE_ARG=1; shift ;;
         --no-hy2-obfs) HY2_OBFS_ARG=0; shift ;;
         --no-ipv6) IPV6_ARG=0; shift ;;
         --no-firewall) FW_ARG=0; shift ;;
@@ -110,6 +120,15 @@ state_set ENABLE_IPV6 "$IPV6_ARG"
 state_set SETUP_FIREWALL "$FW_ARG"
 state_set BLOCK_TORRENT "$BT_ARG"
 state_set HY2_OBFS "$HY2_OBFS_ARG"
+state_set HY2_MANAGED "$([ "$KEEP_HY2" = "1" ] && echo 0 || echo 1)"
+if [ "$KEEP_HY2" = "1" ] && [ -s /etc/hysteria/config.yaml ]; then
+    # порт нужен firewall'у, а он настраивается раньше этапа Hysteria — читаем сейчас
+    p_detected=$(awk -F: '/^[[:space:]]*listen:/{gsub(/[^0-9]/,"",$NF); print $NF; exit}' /etc/hysteria/config.yaml)
+    [ -n "$p_detected" ] && { state_set HY2_PORT "$p_detected"; log "Ваша Hysteria слушает UDP/${p_detected} — открою этот порт."; }
+fi
+[ -n "$HY2_CERT_ARG" ] && state_set HY2_CERT "$HY2_CERT_ARG"
+[ -n "$HY2_KEY_ARG" ] && state_set HY2_KEY "$HY2_KEY_ARG"
+state_set HY2_INSECURE_FORCE "$HY2_INSECURE_ARG"
 state_set CLIENT_DNS4 "${CLIENT_DNS4:-1.1.1.1}"
 state_set CLIENT_DNS6 "${CLIENT_DNS6:-2606:4700:4700::1111}"
 state_set TAG_PREFIX "${TAG_PREFIX:-$(hostname -s 2>/dev/null || echo vpn)}"
@@ -126,6 +145,24 @@ log "Клиенты будут подключаться на: ${ENDPOINT}"
 [ "$VLESS_PORT" = "$HY2_PORT" ] && log "VLESS на TCP/${VLESS_PORT}, Hysteria2 на UDP/${HY2_PORT} — конфликта нет (разные протоколы)."
 
 run_part() { case ",${ONLY}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+# Порт занят кем-то посторонним? Лучше сказать сразу, чем ловить молчаливый сбой.
+port_owner() { # port_owner tcp|udp ПОРТ  -> имя процесса или пусто
+    local f; [ "$1" = "tcp" ] && f=-lnt || f=-lnu
+    ss -H "$f" -p 2>/dev/null | awk -v p="$2" '$4 ~ ("[:.]" p "$") {print $NF; exit}' \
+        | sed -n 's/.*users:((\"\([^\"]*\)\".*/\1/p'
+}
+check_port() { # check_port tcp|udp ПОРТ ОЖИДАЕМЫЙ_ПРОЦЕСС ОПИСАНИЕ
+    local owner; owner=$(port_owner "$1" "$2")
+    [ -z "$owner" ] && return 0
+    [ "$owner" = "$3" ] && { log "$4: порт $1/$2 уже занят своим же процессом ($owner) — это нормально."; return 0; }
+    err "$4: порт $1/$2 занят процессом '$owner'."
+    err "Освободите его, либо задайте другой порт (--vless-port / --hy2-port / --awg-port)."
+    die "Установка остановлена, чтобы ничего не сломать."
+}
+
+run_part xray     && check_port tcp "$VLESS_PORT" xray     "VLESS REALITY"
+[ "$KEEP_HY2" = "1" ] || { run_part hysteria && check_port udp "$HY2_PORT" hysteria "Hysteria2"; }
 
 run_part base     && . "$VPNSTACK_DIR/scripts/00-prepare.sh"
 run_part xray     && . "$VPNSTACK_DIR/scripts/10-xray-reality.sh"

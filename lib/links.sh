@@ -16,7 +16,7 @@ hy2_link() { # hy2_link NAME
     pass=$(client_get "$name" hy2_pass); [ -n "$pass" ] || return 1
     q="sni=${HY2_SNI}"
     [ -n "${HY2_OBFS_PASS:-}" ] && q="${q}&obfs=salamander&obfs-password=$(urlenc "$HY2_OBFS_PASS")"
-    [ "${HY2_TLS_MODE:-selfsigned}" = "acme" ] || q="${q}&insecure=1"
+    if [ "${HY2_INSECURE:-0}" = "1" ]; then q="${q}&insecure=1"; fi
     printf 'hy2://%s:%s@%s:%s/?%s#%s\n' \
         "$(urlenc "$name")" "$(urlenc "$pass")" "$ENDPOINT" "${HY2_PORT:-443}" "$q" \
         "$(urlenc "${TAG_PREFIX:-VPN}-HY2-$name")"
