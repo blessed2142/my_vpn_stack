@@ -139,10 +139,16 @@ cmd_tls_acme() {
     state_set HY2_DOMAIN "$d"; state_set HY2_SNI "$d"
     state_set ACME_EMAIL "$e"; state_set HY2_TLS_MODE acme
     mkdir -p /var/lib/hysteria/acme; chown -R hysteria:hysteria /var/lib/hysteria
+    state_set HY2_INSECURE 0
     render_hysteria; systemctl restart hysteria-server; sleep 3
     svc_active hysteria-server && ok "Hysteria2 переведена на Let's Encrypt ($d)." \
         || die "Не запустилась. Логи: journalctl -u hysteria-server -n 50"
-    warn "Ссылки Hysteria2 изменились — раздайте заново: vpnctl links"
+    # раз домен теперь указывает сюда — подключаться лучше по имени, а не по IP
+    if [ "${ENDPOINT:-}" = "${SERVER_IP4}" ]; then
+        state_set ENDPOINT "$d"
+        ok "Адрес подключения в ссылках переключён с ${SERVER_IP4} на ${d}."
+    fi
+    warn "Ссылки изменились — раздайте заново: vpnctl links"
 }
 
 case "${1:-}" in
