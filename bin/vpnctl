@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# vpnctl — управление пользователями и состоянием VPN-стека.
+set -euo pipefail
+
+VPNSTACK_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
+. "$VPNSTACK_DIR/lib/common.sh"
+. "$VPNSTACK_DIR/lib/render.sh"
+. "$VPNSTACK_DIR/lib/links.sh"
+
+require_root
+detect_os
+clients_init
+state_load
+
+usage() {
+cat <<USAGE
+vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + AmneziaWG)
+
+  vpnctl add <имя> [--qr]     создать клиента во всех трёх протоколах
+  vpnctl del <имя>            удалить клиента
+  vpnctl list                 список клиентов
+  vpnctl show <имя> [--qr]    ссылки/конфиги клиента
+  vpnctl links [--qr]         ссылки всех клиентов
+  vpnctl status               состояние сервисов и портов
+  vpnctl regen                перегенерировать конфиги из состояния и перезапустить
+  vpnctl restart              перезапустить все сервисы
+  vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
+  vpnctl info                 параметры сервера (порты, SNI, ключи)
+USAGE
+}
+
+next_awg_index() {
+    local used max=1 i
+    used=$(jq -r '.clients[]? | .awg_ip4 // empty' "$CLIENTS_FILE" | awk -F. '{print $4}')
+    for i in $used; do [ "$i" -gt "$max" ] && max="$i"; done
+    echo $((max + 1))
+}
+
+cmd_add() {
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] || die "Укажите имя: vpnctl add <имя>"
+    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "Имя: латиница/цифры/._- до 32 символов."
+    client_exists "$name" && die "Клиент '$name' уже существует."
+
+    local uuid hy2p priv pub psk idx ip4 ip6
+    uuid=$( [ -n "${REALITY_PRIVATE_KEY:-}" ] && (have xray && xray uuid || cat /proc/sys/kernel/random/uuid) || echo "" )
+    hy2p=$( [ -n "${HY2_PORT:-}" ] && rand_pass || echo "" )
+    if [ -n "${AWG_PUBLIC_KEY:-}" ]; then
+        priv=$(awg genkey); pub=$(printf '%s' "$priv" | awg pubkey); psk=$(awg genpsk)
+        idx=$(next_awg_index)
+        [ "$idx" -le 254 ] || die "Свободные адреса в подсети AmneziaWG закончились."
+        ip4="${AWG_NET4_PREFIX}.${idx}"
+        ip6="${AWG_NET6_PREFIX}::${idx}"
+    fi
+
+    jq --arg n "$name" --arg uuid "$uuid" --arg hy2 "$hy2p" \
+       --arg priv "${priv:-}" --arg pub "${pub:-}" --arg psk "${psk:-}" \
+       --arg ip4 "${ip4:-}" --arg ip6 "${ip6:-}" --arg ts "$(date -Is)" '
+        .clients[$n] = ({created: $ts}
+          + (if $uuid != "" then {uuid: $uuid} else {} end)
+          + (if $hy2  != "" then {hy2_pass: $hy2} else {} end)
+          + (if $pub  != "" then {awg_priv: $priv, awg_pub: $pub, awg_psk: $psk,
+                                  awg_ip4: $ip4, awg_ip6: $ip6} else {} end))
+       ' "$CLIENTS_FILE" | clients_write
+
+    render_all; reload_all
+    ok "Клиент '$name' создан."
+    state_load
+    show_client "$name" "${1:-}"
+}
+
+cmd_del() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "Укажите имя: vpnctl del <имя>"
+    client_exists "$name" || die "Клиент '$name' не найден."
+    jq --arg n "$name" 'del(.clients[$n])' "$CLIENTS_FILE" | clients_write
+    rm -rf "${STATE_DIR:?}/clients/$name"
+    render_all; reload_all
+    ok "Клиент '$name' удалён."
+}
+
+cmd_list() {
+    printf '%-20s %-38s %-16s %s\n' "ИМЯ" "UUID (VLESS)" "AWG IP" "СОЗДАН"
+    jq -r '.clients | to_entries[] |
+        [.key, (.value.uuid // "-"), (.value.awg_ip4 // "-"), (.value.created // "-")] | @tsv' \
+        "$CLIENTS_FILE" | while IFS=$'\t' read -r n u a c; do
+        printf '%-20s %-38s %-16s %s\n' "$n" "$u" "$a" "$c"
+    done
+}
+
+cmd_links() {
+    local n
+    for n in $(clients_names); do show_client "$n" "${1:-}"; done
+}
+
+cmd_status() {
+    hdr "Сервисы"
+    local s
+    for s in xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; do
+        if svc_active "$s"; then printf '  %s%-28s активен%s\n' "$C_GRN" "$s" "$C_OFF"
+        else printf '  %s%-28s НЕ активен%s\n' "$C_RED" "$s" "$C_OFF"; fi
+    done
+    hdr "Слушающие порты"
+    ss -lntup 2>/dev/null | grep -E 'xray|hysteria|:'"${AWG_PORT:-51820}" || true
+    if have awg && awg show "${AWG_IFACE:-awg0}" >/dev/null 2>&1; then
+        hdr "AmneziaWG пиры"; awg show "${AWG_IFACE:-awg0}"
+    fi
+    hdr "Firewall"
+    nft list table inet filter >/dev/null 2>&1 && echo "  nftables: правила загружены" || echo "  nftables: правил нет"
+}
+
+cmd_info() {
+    hdr "Параметры сервера"
+    cat <<INFO
+  Точка подключения : ${ENDPOINT:-?}
+  IPv4 / IPv6       : ${SERVER_IP4:-?} / ${SERVER_IP6:--}
+
+  VLESS REALITY     : TCP ${VLESS_PORT:-443}
+    SNI/dest        : ${REALITY_SNI:-?}
+    public key      : ${REALITY_PUBLIC_KEY:-?}
+    short id        : ${REALITY_SHORT_ID:-?}
+
+  Hysteria2         : UDP ${HY2_PORT:-?}   TLS: ${HY2_TLS_MODE:-?}   SNI: ${HY2_SNI:-?}
+    obfs salamander : ${HY2_OBFS_PASS:+включена}${HY2_OBFS_PASS:-выключена}
+
+  AmneziaWG         : UDP ${AWG_PORT:-?}   режим: $( [ "${AWG_USE_KERNEL:-0}" = 1 ] && echo ядро || echo userspace )
+    сеть            : ${AWG_NET4_PREFIX:-?}.0/24 , ${AWG_NET6_PREFIX:-?}::/64
+    server pubkey   : ${AWG_PUBLIC_KEY:-?}
+    обфускация      : Jc=${AWG_JC:-?} Jmin=${AWG_JMIN:-?} Jmax=${AWG_JMAX:-?} S1=${AWG_S1:-?} S2=${AWG_S2:-?}
+                      H1=${AWG_H1:-?} H2=${AWG_H2:-?} H3=${AWG_H3:-?} H4=${AWG_H4:-?}
+INFO
+}
+
+cmd_tls_acme() {
+    local d="${1:-}" e="${2:-}"
+    [ -n "$d" ] && [ -n "$e" ] || die "Использование: vpnctl tls-acme <домен> <email>"
+    domain_points_here "$d" "${SERVER_IP4}" || die "A-запись $d не указывает на ${SERVER_IP4}."
+    state_set HY2_DOMAIN "$d"; state_set HY2_SNI "$d"
+    state_set ACME_EMAIL "$e"; state_set HY2_TLS_MODE acme
+    mkdir -p /var/lib/hysteria/acme; chown -R hysteria:hysteria /var/lib/hysteria
+    render_hysteria; systemctl restart hysteria-server; sleep 3
+    svc_active hysteria-server && ok "Hysteria2 переведена на Let's Encrypt ($d)." \
+        || die "Не запустилась. Логи: journalctl -u hysteria-server -n 50"
+    warn "Ссылки Hysteria2 изменились — раздайте заново: vpnctl links"
+}
+
+case "${1:-}" in
+    add)     shift; cmd_add "$@" ;;
+    del|rm)  shift; cmd_del "$@" ;;
+    list|ls) cmd_list ;;
+    show)    shift; name="${1:-}"; shift || true; show_client "$name" "${1:-}" ;;
+    links)   shift || true; cmd_links "${1:-}" ;;
+    status)  cmd_status ;;
+    info)    cmd_info ;;
+    regen)   render_all; reload_all; ok "Конфиги перегенерированы." ;;
+    restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
+    tls-acme) shift; cmd_tls_acme "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) err "Неизвестная команда: $1"; usage; exit 1 ;;
+esac
