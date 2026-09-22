@@ -38,6 +38,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl set-fp <отпечаток>   сменить отпечаток TLS в ссылках
   vpnctl set-sni <домен>      сменить маскировочный домен (с проверкой) и выдать ссылки
   vpnctl set-port <порт>      перенести VLESS на другой порт (если душат 443)
+  vpnctl capture [порт] [сек] посмотреть, доходят ли TLS-приветствия до сервера
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -548,6 +549,50 @@ cmd_set_sni() {
     cmd_links --qr
 }
 
+# Смотрит на провод: доходит ли до сервера TLS-приветствие клиента вообще.
+# Единственный способ отличить "клиент ничего не шлёт" от "шлёт, но сервер не
+# разбирает" — посмотреть на сами пакеты.
+cmd_capture() {
+    local port="${1:-${VLESS_PORT:-443}}" secs="${2:-45}"
+    have tcpdump || { log "Ставлю tcpdump..."; pkg_install tcpdump || die "Не удалось поставить tcpdump."; }
+    local f; f=$(mktemp /tmp/vpnstack-capture-XXXX.pcap)
+
+    hdr "Захват трафика на tcp/${port}"
+    echo "  Ловлю ${secs} секунд. ПРЯМО СЕЙЧАС попробуйте подключиться с устройства."
+    timeout "$secs" tcpdump -i any -nn -s 0 -w "$f" "tcp port ${port}" >/dev/null 2>&1 || true
+
+    local total syn hello
+    total=$(tcpdump -r "$f" -nn 2>/dev/null | wc -l)
+    syn=$(tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null | wc -l)
+    hello=$(tcpdump -r "$f" -nn 'tcp[((tcp[12:1] & 0xf0) >> 2)] = 0x16' 2>/dev/null | wc -l)
+
+    hdr "Итог"
+    printf '  пакетов всего            : %s\n' "$total"
+    printf '  попыток соединения (SYN) : %s\n' "$syn"
+    printf '  TLS-приветствий          : %s\n' "$hello"
+
+    hdr "Кто подключался"
+    tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null \
+        | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/    /'
+
+    hdr "Что это значит"
+    if [ "$syn" -eq 0 ]; then
+        echo "  До сервера не дошло ни одной попытки соединения."
+        echo "  Трафик режут по дороге либо клиент идёт не на этот адрес/порт."
+    elif [ "$hello" -eq 0 ]; then
+        echo "  Соединения открываются, но TLS-приветствие не приходит НИ ОДНО."
+        echo "  Клиент либо ничего не отправляет, либо его пакет теряется по пути."
+        echo "  Первые байты того, что всё-таки пришло:"
+        tcpdump -r "$f" -nn -A -c 3 'tcp[tcpflags] & tcp-push != 0' 2>/dev/null | head -n 20 | sed 's/^/    /'
+        echo "    (пусто — значит не пришло ничего)"
+    else
+        echo "  Приветствия ДОХОДЯТ (${hello} шт.) — провод в порядке."
+        echo "  Значит их отвергает сам Xray: смотрите vpnctl debug log."
+    fi
+    echo
+    echo "  Файл захвата: ${f}"
+}
+
 # Смена порта VLESS: конфиг, правила firewall и ссылки меняются вместе.
 # Нужна, когда провайдер душит именно 443/tcp.
 cmd_set_port() {
@@ -707,6 +752,7 @@ case "${1:-}" in
     set-fp)  shift; cmd_set_fp "${1:-}" ;;
     set-sni) shift; cmd_set_sni "${1:-}" ;;
     set-port) shift; cmd_set_port "${1:-}" ;;
+    capture) shift; cmd_capture "${1:-}" "${2:-45}" ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
