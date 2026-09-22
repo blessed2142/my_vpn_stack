@@ -31,6 +31,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl diag                 полная диагностика для разбора проблем
   vpnctl check-ports          доступны ли порты снаружи (кто виноват: хостер или клиент)
   vpnctl selftest             подключиться к своему же VLESS настоящим клиентом
+  vpnctl fix-keys             привести ключи REALITY в соответствие друг другу
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -294,8 +295,10 @@ cmd_debug() {
 }
 
 # Поднимает на сервере настоящий клиент Xray и ходит через него наружу.
-# Разводит три случая: сломан протокол/конфиг, сломан сетевой путь, или всё
-# исправно и дело в приложении на устройстве.
+# Разводит: испорченные ключи, недоступный маскировочный сайт, мёртвый
+# внешний канал, сломанный сетевой путь и проблему в приложении.
+_TEST_URL="https://cp.cloudflare.com/generate_204"
+
 _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
     local addr="$1" label="$2" tmp pid code port=10809
     local name uuid
@@ -307,7 +310,7 @@ _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
     jq -n --arg addr "$addr" --argjson vport "${VLESS_PORT:-443}" --argjson sport "$port" \
           --arg uuid "$uuid" --arg sni "${REALITY_SNI}" \
           --arg pbk "${REALITY_PUBLIC_KEY}" --arg sid "${REALITY_SHORT_ID}" '{
-        log: { loglevel: "warning" },
+        log: { loglevel: "debug" },
         inbounds: [{ listen: "127.0.0.1", port: $sport, protocol: "socks",
                      settings: { udp: false } }],
         outbounds: [{
@@ -323,9 +326,9 @@ _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
     xray run -c "$tmp/client.json" >"$tmp/log" 2>&1 &
     pid=$!
     sleep 2
-    code=$(timeout 25 curl -s -o /dev/null -w '%{http_code}' \
-           --proxy "socks5h://127.0.0.1:${port}" --max-time 20 \
-           https://cp.cloudflare.com/generate_204 2>/dev/null || echo 000)
+    code=$(timeout 30 curl -s -o /dev/null -w '%{http_code}' \
+           --proxy "socks5h://127.0.0.1:${port}" --max-time 25 "$_TEST_URL" 2>/dev/null) || code=""
+    [ -n "$code" ] || code="000"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
 
@@ -333,18 +336,76 @@ _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
         printf '  %s%s: трафик прошёл%s\n' "$C_GRN" "$label" "$C_OFF"
         rm -rf "$tmp"; return 0
     fi
-    printf '  %s%s: не прошёл (код %s)%s\n' "$C_RED" "$label" "$code" "$C_OFF"
-    sed 's/^/      /' "$tmp/log" 2>/dev/null | tail -n 5
+    printf '  %s%s: не прошёл (HTTP %s)%s\n' "$C_RED" "$label" "$code" "$C_OFF"
+    grep -iE 'reality|error|fail|reject|timeout|refused' "$tmp/log" 2>/dev/null \
+        | tail -n 6 | sed 's/^/      /'
     rm -rf "$tmp"; return 1
 }
 
 cmd_selftest() {
     have xray || die "Xray не установлен."
     [ -n "${REALITY_PUBLIC_KEY:-}" ] || die "VLESS не настроен."
-    hdr "Самопроверка VLESS REALITY"
-    echo "  Поднимаю клиент Xray прямо на сервере и пробую выйти в интернет."
-    echo
 
+    # Сверяем не состояние с самим собой, а то, что раздаётся клиентам, с тем,
+    # что реально использует запущенный сервер. Любое расхождение параметров
+    # REALITY даёт один и тот же симптом: клиент виснет, сервер молчит.
+    hdr "1. Параметры REALITY: ссылки против рабочего конфига"
+    local cfg=/usr/local/etc/xray/config.json
+    [ -s "$cfg" ] || die "Нет конфига ${cfg}"
+    local c_priv c_sni c_sid derived bad=0
+    c_priv=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$cfg")
+    c_sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$cfg")
+    c_sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$cfg")
+
+    derived=$(xray x25519 -i "$c_priv" 2>/dev/null \
+              | grep -iE '^[[:space:]]*(public|password)' | head -n1 | sed 's/.*:[[:space:]]*//')
+    if [ -z "$derived" ]; then
+        warn "  публичный ключ из приватного вывести не удалось — проверку пропускаю"
+    elif [ "$derived" = "${REALITY_PUBLIC_KEY}" ]; then
+        ok "  публичный ключ соответствует приватному из конфига"
+    else
+        err "  КЛЮЧИ НЕ СОГЛАСОВАНЫ — клиенты не могут опознать сервер."
+        echo "      раздаётся в ссылках : ${REALITY_PUBLIC_KEY}"
+        echo "      нужен по конфигу    : ${derived}"
+        bad=1
+    fi
+    if [ "$c_sni" = "${REALITY_SNI}" ]; then
+        ok "  sni совпадает: ${c_sni}"
+    else
+        err "  SNI расходится: в ссылках '${REALITY_SNI}', в конфиге '${c_sni}'"; bad=1
+    fi
+    if [ "$c_sid" = "${REALITY_SHORT_ID}" ]; then
+        ok "  shortId совпадает"
+    else
+        err "  shortId расходится: в ссылках '${REALITY_SHORT_ID}', в конфиге '${c_sid}'"; bad=1
+    fi
+    if [ "$bad" = 1 ]; then
+        echo
+        echo "      Починить:  vpnctl fix-keys   (затем раздать ссылки заново)"
+        return 1
+    fi
+
+    hdr "2. Внешний канал сервера"
+    local base
+    base=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$_TEST_URL" 2>/dev/null) || base=""
+    if [ "$base" = "204" ] || [ "$base" = "200" ]; then
+        ok "  сервер сам ходит в интернет (HTTP ${base})"
+    else
+        err "  сервер НЕ может выйти в интернет (HTTP ${base:-000}) — сначала это."
+        return 1
+    fi
+
+    hdr "3. Маскировочный сайт ${REALITY_SNI}"
+    if timeout 15 openssl s_client -connect "${REALITY_SNI}:443" -servername "${REALITY_SNI}" \
+         -alpn h2 -tls1_3 </dev/null 2>/dev/null | grep -q 'ALPN protocol: h2'; then
+        ok "  доступен, отдаёт TLS 1.3 + h2"
+    else
+        err "  НЕдоступен или не отдаёт TLS1.3/h2 — REALITY работать не будет."
+        echo "      Сменить: ./install.sh --only xray --reality-sni <другой домен>"
+        return 1
+    fi
+
+    hdr "4. Подключение настоящим клиентом"
     local lo=0 ext=0
     _selftest_vless "127.0.0.1" "через loopback (только протокол)" && lo=1
     _selftest_vless "${ENDPOINT}" "через ${ENDPOINT} (протокол + сеть)" && ext=1
@@ -353,14 +414,38 @@ cmd_selftest() {
     if [ "$lo" = 1 ] && [ "$ext" = 1 ]; then
         echo "  Сервер и сетевой путь исправны: настоящий клиент подключается."
         echo "  Значит дело в приложении на устройстве или в его сети."
-        echo "  Проверьте: другое приложение, другая сеть (мобильный интернет вместо Wi-Fi)."
     elif [ "$lo" = 1 ] && [ "$ext" = 0 ]; then
         echo "  Протокол работает, но через внешний адрес — нет."
-        echo "  Трафик рвут по дороге: внешний firewall хостера или фильтрация по пути."
+        echo "  Трафик рвут по дороге: внешний firewall хостера или фильтрация."
     else
-        echo "  Не работает даже через loopback — проблема на сервере."
-        echo "  Пришлите вывод целиком, разберём."
+        echo "  Не работает даже через loopback."
+        echo "  Ключи, канал и маскировочный сайт при этом в порядке — смотрите строки"
+        echo "  лога выше и пришлите их; заодно: vpnctl debug on, повторить, vpnctl debug log."
     fi
+}
+
+# Перевыпускает пару ключей REALITY, если публичный в состоянии не соответствует
+# приватному в конфиге. Все выданные ссылки после этого надо раздать заново.
+cmd_fix_keys() {
+    have xray || die "Xray не установлен."
+    local derived
+    derived=$(xray x25519 -i "${REALITY_PRIVATE_KEY}" 2>/dev/null \
+              | grep -iE '^[[:space:]]*(public|password)' | head -n1 | sed 's/.*:[[:space:]]*//')
+    if [ -n "$derived" ] && [ "$derived" != "${REALITY_PUBLIC_KEY}" ]; then
+        state_set REALITY_PUBLIC_KEY "$derived"
+        ok "Публичный ключ исправлен на соответствующий приватному."
+    else
+        log "Пара уже согласована — перевыпускаю целиком."
+        local k priv pub
+        k=$(xray x25519)
+        priv=$(grep -iE '^[[:space:]]*private' <<<"$k" | head -n1 | sed 's/.*:[[:space:]]*//')
+        pub=$(grep -iE '^[[:space:]]*(public|password)' <<<"$k" | head -n1 | sed 's/.*:[[:space:]]*//')
+        [ -n "$priv" ] && [ -n "$pub" ] || die "Не смог разобрать вывод xray x25519."
+        state_set REALITY_PRIVATE_KEY "$priv"; state_set REALITY_PUBLIC_KEY "$pub"
+        ok "Пара ключей перевыпущена."
+    fi
+    state_load; render_xray; systemctl restart xray
+    warn "Ссылки VLESS изменились — раздайте заново: vpnctl links --qr"
 }
 
 cmd_firewall() {
@@ -488,6 +573,7 @@ case "${1:-}" in
     firewall) shift; cmd_firewall "${1:-}" ;;
     check-ports) cmd_check_ports ;;
     selftest) cmd_selftest ;;
+    fix-keys) cmd_fix_keys ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
