@@ -115,6 +115,38 @@ ssh_ports() {
 
 svc_active() { systemctl is-active --quiet "$1"; }
 
+# Жив ли выход наружу: резолвинг имени и реальный HTTPS-запрос.
+net_sanity_check() {
+    local host="${1:-github.com}" i
+    for i in 1 2 3; do
+        if getent hosts "$host" >/dev/null 2>&1 \
+           && timeout 12 curl -fsS -o /dev/null "https://${host}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# Если резолвинг сломан, а resolv.conf пуст или указывает в никуда —
+# подставляем публичные резолверы, иначе сервер не починить без консоли.
+ensure_dns() {
+    getent hosts github.com >/dev/null 2>&1 && return 0
+    warn "DNS не резолвит имена. Проверяю /etc/resolv.conf..."
+    if [ -L /etc/resolv.conf ] && systemctl is-active --quiet systemd-resolved; then
+        warn "resolv.conf под управлением systemd-resolved — трогать не буду."
+        return 1
+    fi
+    cp -a /etc/resolv.conf /etc/resolv.conf.vpnstack-bak 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+    if getent hosts github.com >/dev/null 2>&1; then
+        ok "Добавил публичные резолверы в /etc/resolv.conf — DNS заработал."
+        return 0
+    fi
+    err "DNS не заработал и с публичными резолверами — дело не в них."
+    return 1
+}
+
 # Ждёт, пока сервис не только «активен», но и реально занял свой порт.
 # Сервисы вроде hysteria стартуют мгновенно, а падают через пару секунд
 # (например, не получив сертификат), поэтому проверка сразу после restart врёт.

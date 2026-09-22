@@ -1,5 +1,51 @@
 # Если что-то не работает
 
+## На сервере пропал DNS / нет интернета
+
+Признак: `Could not resolve host: github.com`, `apt update` висит.
+
+```bash
+vpnctl diag          # раздел «Сеть» покажет resolv.conf, маршруты, ping, резолвинг
+```
+
+Быстрая развилка:
+
+```bash
+ping -c2 1.1.1.1              # пингуется, а имена не резолвятся -> проблема в DNS
+getent hosts github.com
+ip -6 route show default      # пусто, а раньше был -> см. accept_ra ниже
+```
+
+**Не резолвятся имена, IP пингуется.** Проверьте `/etc/resolv.conf`. Если он
+пуст или ведёт в никуда:
+
+```bash
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+```
+
+Если файл — симлинк на systemd-resolved, чините сам resolved:
+`systemctl restart systemd-resolved`.
+
+**Пропал только IPv6.** Включение `net.ipv6.conf.all.forwarding=1` (нужно для
+VPN) заставляет ядро игнорировать Router Advertisement, и на серверах со SLAAC
+исчезает маршрут по умолчанию. Лечится `accept_ra=2`, он уже прописан в
+`/etc/sysctl.d/99-vpnstack.conf`; применить:
+
+```bash
+sysctl --system && systemctl restart systemd-networkd 2>/dev/null
+```
+
+**Ничего не пингуется.** Скорее всего правила firewall. Выключите и проверьте:
+
+```bash
+vpnctl firewall off
+ping -c2 1.1.1.1
+vpnctl firewall on
+```
+
+Начиная с текущей версии установщик сам проверяет связь после включения
+firewall и откатывает правила, если она пропала.
+
 ## Куда указывает домен (если нет `dig`)
 
 ```bash

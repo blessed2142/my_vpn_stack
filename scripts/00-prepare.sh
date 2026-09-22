@@ -4,6 +4,8 @@ set -euo pipefail
 
 hdr "Подготовка системы ($OS_PRETTY)"
 
+ensure_dns || warn "Продолжаю, но скачивание пакетов может не сработать."
+
 log "Обновляю индекс пакетов и ставлю зависимости..."
 pkg_update
 case "$PKG" in
@@ -22,6 +24,13 @@ cat > /etc/sysctl.d/99-vpnstack.conf <<'SYS'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
+
+# Включение forwarding заставляет ядро игнорировать Router Advertisement,
+# и на серверах, получающих IPv6 через SLAAC, пропадает маршрут по умолчанию
+# (а вместе с ним DNS, если резолверы указаны по IPv6). accept_ra=2 возвращает
+# приём RA при включённом форвардинге.
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
 
 # --- перегрузка/очередь: BBR + fq ---
 net.core.default_qdisc = fq
@@ -118,7 +127,18 @@ NFT
     if nft -c -f /etc/nftables.conf; then
         systemctl enable nftables >/dev/null 2>&1 || true
         systemctl restart nftables
-        ok "Firewall включён (открыты: SSH ${sshp}, 80/tcp, ${VLESS_PORT:-443}/tcp, ${HY2_PORT:-443}/udp, ${awgport}/udp)."
+        # Правило, отрезавшее сервер от сети, чинить потом по SSH уже нечем.
+        if net_sanity_check; then
+            ok "Firewall включён (открыты: SSH ${sshp}, 80/tcp, ${VLESS_PORT:-443}/tcp, ${HY2_PORT:-443}/udp, ${awgport}/udp)."
+        else
+            err "После включения firewall пропала связь наружу — откатываю правила."
+            nft flush ruleset 2>/dev/null || true
+            if [ -f /etc/nftables.conf.vpnstack-bak ]; then
+                cp /etc/nftables.conf.vpnstack-bak /etc/nftables.conf
+                nft -f /etc/nftables.conf 2>/dev/null || true
+            fi
+            return 1
+        fi
     else
         err "Правила nftables не прошли проверку — firewall НЕ применён."
         [ -f /etc/nftables.conf.vpnstack-bak ] && cp /etc/nftables.conf.vpnstack-bak /etc/nftables.conf

@@ -28,6 +28,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl diag                 полная диагностика для разбора проблем
+  vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
   vpnctl import-hysteria [файл]   забрать пользователей и пароль обфускации
                               из конфига Hysteria, настроенного вручную
@@ -174,6 +175,25 @@ cmd_tls_acme() {
     warn "Ссылки изменились — раздайте заново: vpnctl links"
 }
 
+# Аварийный выключатель: если правила отрезали сервер, чинить надо быстро.
+cmd_firewall() {
+    case "${1:-}" in
+        off)
+            nft flush ruleset 2>/dev/null || true
+            systemctl stop nftables 2>/dev/null || true
+            warn "Firewall выключен полностью — сервер открыт, включите обратно после разбора."
+            ok "Вернуть: vpnctl firewall on" ;;
+        on)
+            [ -s /etc/nftables.conf ] || die "Нет /etc/nftables.conf — переустановите: ./install.sh --only base"
+            nft -f /etc/nftables.conf || die "Правила не применились."
+            systemctl start nftables 2>/dev/null || true
+            ok "Firewall включён." ;;
+        status|"")
+            nft list ruleset 2>/dev/null | head -n 40 || echo "  правил нет" ;;
+        *) die "Использование: vpnctl firewall on|off|status" ;;
+    esac
+}
+
 # Полный срез состояния для разбора проблем. Секреты замаскированы.
 cmd_diag() {
     hdr "Система"
@@ -197,6 +217,27 @@ cmd_diag() {
 
     hdr "Слушающие порты"
     ss -lntup 2>/dev/null | grep -vE '127\.0\.0\.1|\[::1\]' || true
+
+    hdr "Сеть"
+    printf '  resolv.conf (%s):\n' "$(readlink -f /etc/resolv.conf 2>/dev/null || echo '?')"
+    sed 's/^/    /' /etc/resolv.conf 2>/dev/null | head -n 6 || true
+    printf '  systemd-resolved: %s\n' "$(systemctl is-active systemd-resolved 2>/dev/null)"
+    printf '  маршрут v4: %s\n' "$(ip -4 route show default 2>/dev/null | head -n1)"
+    printf '  маршрут v6: %s\n' "$(ip -6 route show default 2>/dev/null | head -n1)"
+    printf '  accept_ra : all=%s default=%s | forwarding v6=%s\n' \
+        "$(sysctl -n net.ipv6.conf.all.accept_ra 2>/dev/null)" \
+        "$(sysctl -n net.ipv6.conf.default.accept_ra 2>/dev/null)" \
+        "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)"
+    if timeout 6 ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+        echo "  ping 1.1.1.1      : ок"
+    else
+        echo "  ping 1.1.1.1      : НЕТ (маршрутизация или firewall)"
+    fi
+    if getent hosts github.com >/dev/null 2>&1; then
+        echo "  резолвинг имён    : ок"
+    else
+        echo "  резолвинг имён    : СЛОМАН"
+    fi
 
     hdr "Состояние (секреты скрыты)"
     sed -E "s/^(REALITY_PRIVATE_KEY|AWG_PRIVATE_KEY|HY2_OBFS_PASS)=.*/\1='***'/" \
@@ -253,6 +294,7 @@ case "${1:-}" in
     restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
     tls-acme) shift; cmd_tls_acme "$@" ;;
     diag)    cmd_diag ;;
+    firewall) shift; cmd_firewall "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
 esac
