@@ -71,6 +71,12 @@ render_hysteria() {
         log "Hysteria2 под вашим ручным управлением — конфиг не трогаю."
         return 0
     fi
+    case "${HY2_TLS_MODE:-selfsigned}" in
+        custom) [ -n "${HY2_CERT:-}" ] && [ -n "${HY2_KEY:-}" ] \
+                    || die "HY2_TLS_MODE=custom, но HY2_CERT/HY2_KEY не заданы." ;;
+        acme)   [ -n "${HY2_DOMAIN:-}" ] \
+                    || die "HY2_TLS_MODE=acme, но домен не задан. Укажите его: vpnctl tls-acme <домен> <email>" ;;
+    esac
     mkdir -p "$(dirname "$HY2_CONF")"
     {
         echo "# Сгенерировано vpnstack — руками не править, используйте vpnctl."
@@ -84,7 +90,7 @@ render_hysteria() {
             echo "acme:"
             echo "  domains:"
             echo "    - ${HY2_DOMAIN}"
-            echo "  email: ${ACME_EMAIL}"
+            echo "  email: ${ACME_EMAIL:-admin@${HY2_DOMAIN}}"
             echo "  ca: letsencrypt"
             echo "  dir: /var/lib/hysteria/acme"
             echo "  listenHost: 0.0.0.0"
@@ -138,11 +144,11 @@ render_awg() {
         echo "# Сгенерировано vpnstack — руками не править, используйте vpnctl."
         echo "[Interface]"
         if [ "${ENABLE_IPV6:-1}" = "1" ]; then
-            echo "Address = ${AWG_NET4_PREFIX}.1/24, ${AWG_NET6_PREFIX}::1/64"
+            echo "Address = ${AWG_NET4_PREFIX:-10.8.2}.1/24, ${AWG_NET6_PREFIX:-fd42:2142:2142}::1/64"
         else
-            echo "Address = ${AWG_NET4_PREFIX}.1/24"
+            echo "Address = ${AWG_NET4_PREFIX:-10.8.2}.1/24"
         fi
-        echo "ListenPort = ${AWG_PORT}"
+        echo "ListenPort = ${AWG_PORT:-51820}"
         echo "PrivateKey = ${AWG_PRIVATE_KEY}"
         echo "MTU = ${AWG_MTU:-1420}"
         # Параметры обфускации AmneziaWG (должны совпадать у сервера и клиента)

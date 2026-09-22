@@ -27,6 +27,8 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
+  vpnctl import-hysteria [файл]   забрать пользователей и пароль обфускации
+                              из конфига Hysteria, настроенного вручную
 USAGE
 }
 
@@ -37,15 +39,17 @@ next_awg_index() {
     echo $((max + 1))
 }
 
-cmd_add() {
-    local name="${1:-}"; shift || true
-    [ -n "$name" ] || die "Укажите имя: vpnctl add <имя>"
-    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "Имя: латиница/цифры/._- до 32 символов."
-    client_exists "$name" && die "Клиент '$name' уже существует."
-
+# Создаёт запись клиента. Второй аргумент — готовый пароль Hysteria
+# (используется при импорте старого конфига), иначе генерируется новый.
+client_create() { # client_create ИМЯ [HY2_PASS]
+    local name="$1" forced_hy2="${2:-}"
     local uuid hy2p priv pub psk idx ip4 ip6
     uuid=$( [ -n "${REALITY_PRIVATE_KEY:-}" ] && (have xray && xray uuid || cat /proc/sys/kernel/random/uuid) || echo "" )
-    hy2p=$( [ -n "${HY2_PORT:-}" ] && [ "${HY2_MANAGED:-1}" = "1" ] && rand_pass || echo "" )
+    if [ -n "$forced_hy2" ]; then
+        hy2p="$forced_hy2"
+    else
+        hy2p=$( [ -n "${HY2_PORT:-}" ] && [ "${HY2_MANAGED:-1}" = "1" ] && rand_pass || echo "" )
+    fi
     if [ -n "${AWG_PUBLIC_KEY:-}" ]; then
         priv=$(awg genkey); pub=$(printf '%s' "$priv" | awg pubkey); psk=$(awg genpsk)
         idx=$(next_awg_index)
@@ -63,7 +67,17 @@ cmd_add() {
           + (if $pub  != "" then {awg_priv: $priv, awg_pub: $pub, awg_psk: $psk,
                                   awg_ip4: $ip4, awg_ip6: $ip6} else {} end))
        ' "$CLIENTS_FILE" | clients_write
+}
 
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; }
+
+cmd_add() {
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] || die "Укажите имя: vpnctl add <имя>"
+    valid_name "$name" || die "Имя: латиница/цифры/._- до 32 символов."
+    client_exists "$name" && die "Клиент '$name' уже существует."
+
+    client_create "$name"
     render_all; reload_all
     ok "Клиент '$name' создан."
     state_load
@@ -152,6 +166,75 @@ cmd_tls_acme() {
     warn "Ссылки изменились — раздайте заново: vpnctl links"
 }
 
+# Достаёт из «ручного» конфига Hysteria пароль обфускации, порт и пользователей.
+hy2_parse_obfs() { # hy2_parse_obfs ФАЙЛ
+    awk '/^obfs:/{o=1;next} o&&/^[^[:space:]]/{o=0}
+         o&&/^[[:space:]]*password:/{s=$0
+            sub(/^[[:space:]]*password:[[:space:]]*/,"",s)
+            gsub(/^"|"$/,"",s); gsub(/^\047|\047$/,"",s)
+            print s; exit}' "$1"
+}
+hy2_parse_port() { # hy2_parse_port ФАЙЛ
+    awk -F: '/^[[:space:]]*listen:/{gsub(/[^0-9]/,"",$NF); print $NF; exit}' "$1"
+}
+hy2_parse_users() { # hy2_parse_users ФАЙЛ -> "имя<TAB>пароль"
+    awk '/^[[:space:]]*userpass:/{f=1;next} f&&/^[^[:space:]]/{f=0}
+         f&&/^[[:space:]]+[A-Za-z0-9_.-]+:/{
+            k=$0; sub(/:.*/,"",k); gsub(/[[:space:]]/,"",k)
+            v=$0; sub(/^[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*/,"",v)
+            gsub(/^"|"$/,"",v); gsub(/^\047|\047$/,"",v)
+            if (k != "" && v != "") print k "\t" v}' "$1"
+}
+
+cmd_import_hysteria() { # cmd_import_hysteria ФАЙЛ
+    local f="${1:-}"
+    if [ -z "$f" ]; then
+        f=$(ls -1t /etc/hysteria/config.yaml.manual-* 2>/dev/null | head -n1)
+        [ -n "$f" ] || die "Укажите файл: vpnctl import-hysteria /etc/hysteria/config.yaml.manual-<дата>"
+        log "Беру самый свежий бэкап: $f"
+    fi
+    [ -s "$f" ] || die "Файл не найден: $f"
+    [ "${HY2_MANAGED:-1}" = "1" ] || die "Hysteria в режиме --keep-hysteria, импортировать некуда."
+
+    local obfs port users n added=0 updated=0
+    obfs=$(hy2_parse_obfs "$f"); port=$(hy2_parse_port "$f"); users=$(hy2_parse_users "$f")
+
+    hdr "Импорт из $f"
+    [ -n "$port" ] && printf '  порт в старом конфиге : UDP/%s (сейчас UDP/%s)\n' "$port" "${HY2_PORT:-?}"
+    [ -n "$obfs" ] && printf '  пароль обфускации     : найден\n' || printf '  пароль обфускации     : не найден (обфускация была выключена?)\n'
+    [ -n "$users" ] || die "В файле нет блока auth.userpass — импортировать нечего."
+
+    if [ -n "$obfs" ]; then state_set HY2_OBFS_PASS "$obfs"; else state_set HY2_OBFS_PASS ""; fi
+
+    while IFS=$'\t' read -r n pw; do
+        [ -n "$n" ] || continue
+        if ! valid_name "$n"; then
+            warn "Пропускаю '$n': недопустимое имя для vpnctl."
+            continue
+        fi
+        if client_exists "$n"; then
+            jq --arg n "$n" --arg p "$pw" '.clients[$n].hy2_pass = $p' "$CLIENTS_FILE" | clients_write
+            updated=$((updated + 1))
+        else
+            client_create "$n" "$pw"
+            added=$((added + 1))
+        fi
+    done <<< "$users"
+
+    state_load
+    render_all; reload_all
+    ok "Импортировано: новых ${added}, обновлено ${updated}."
+
+    if [ -n "$port" ] && [ "$port" != "${HY2_PORT:-}" ]; then
+        warn "Порт отличается: старый UDP/${port}, сейчас UDP/${HY2_PORT}."
+        warn "Чтобы старые ссылки заработали полностью, переустановите с этим портом:"
+        warn "  cd /opt/vpnstack && ./install.sh --only base,hysteria --hy2-port ${port}"
+    else
+        ok "Порт совпадает — старые ссылки Hysteria должны заработать как раньше."
+    fi
+    warn "Сертификат тоже должен совпасть: старые ссылки с insecure=1 не подойдут к Let's Encrypt и наоборот."
+}
+
 cmd_dns() {
     local d="${1:-${HY2_DOMAIN:-}}"
     [ -n "$d" ] || die "Укажите домен: vpnctl dns <домен>"
@@ -184,6 +267,7 @@ case "${1:-}" in
     status)  cmd_status ;;
     info)    cmd_info ;;
     dns)     shift; cmd_dns "${1:-}" ;;
+    import-hysteria) shift; cmd_import_hysteria "${1:-}" ;;
     regen)   render_all; reload_all; ok "Конфиги перегенерированы." ;;
     restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
     tls-acme) shift; cmd_tls_acme "$@" ;;
