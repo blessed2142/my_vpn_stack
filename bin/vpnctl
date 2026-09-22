@@ -26,6 +26,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl restart              перезапустить все сервисы
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
+  vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
 USAGE
 }
 
@@ -151,6 +152,29 @@ cmd_tls_acme() {
     warn "Ссылки изменились — раздайте заново: vpnctl links"
 }
 
+cmd_dns() {
+    local d="${1:-${HY2_DOMAIN:-}}"
+    [ -n "$d" ] || die "Укажите домен: vpnctl dns <домен>"
+    hdr "DNS: $d"
+    local ips; ips=$(resolve_a "$d")
+    if [ -z "$ips" ]; then
+        err "Домен не резолвится вообще. Проверьте, что A-запись создана."
+        return 1
+    fi
+    printf '  A-записи      : %s\n' "$(printf '%s' "$ips" | tr '\n' ' ')"
+    printf '  этот сервер   : %s\n' "${SERVER_IP4:-?}"
+    if printf '%s\n' "$ips" | grep -qx "${SERVER_IP4:-нет}"; then
+        ok "Совпадает — можно выдавать сертификат Let's Encrypt."
+        if [ "${HY2_TLS_MODE:-}" = "selfsigned" ]; then
+            warn "Сейчас стоит самоподписанный. Переключить: vpnctl tls-acme $d <email>"
+        fi
+    else
+        warn "Не совпадает: домен ведёт на другой сервер, либо DNS ещё не разошёлся."
+        warn "Пока домен не переедет, Let's Encrypt сертификат не выдаст."
+    fi
+    return 0
+}
+
 case "${1:-}" in
     add)     shift; cmd_add "$@" ;;
     del|rm)  shift; cmd_del "$@" ;;
@@ -159,6 +183,7 @@ case "${1:-}" in
     links)   shift || true; cmd_links "${1:-}" ;;
     status)  cmd_status ;;
     info)    cmd_info ;;
+    dns)     shift; cmd_dns "${1:-}" ;;
     regen)   render_all; reload_all; ok "Конфиги перегенерированы." ;;
     restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
     tls-acme) shift; cmd_tls_acme "$@" ;;

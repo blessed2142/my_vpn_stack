@@ -1,5 +1,23 @@
 # Если что-то не работает
 
+## Куда указывает домен (если нет `dig`)
+
+```bash
+vpnctl dns aslanblessed.space    # на сервере: покажет A-записи и совпадение
+```
+
+Без vpnctl, на любой системе:
+
+| Где | Команда |
+|---|---|
+| Linux (без доустановки) | `getent ahostsv4 aslanblessed.space` |
+| Windows | `nslookup aslanblessed.space 8.8.8.8` |
+| macOS | `nslookup aslanblessed.space 8.8.8.8` или `host aslanblessed.space` |
+| Поставить `dig` на сервер | `apt install -y dnsutils` (Debian/Ubuntu), `dnf install -y bind-utils` (RHEL) |
+
+Явно указанный резолвер (`8.8.8.8`) важен: локальный кэш может ещё держать
+старый адрес, и проверка соврёт.
+
 ## Общая диагностика
 
 ```bash

@@ -115,10 +115,22 @@ ssh_ports() {
 
 svc_active() { systemctl is-active --quiet "$1"; }
 
-# Проверка, что домен указывает на этот сервер
+# Все A-записи домена. dig спрашиваем у публичного резолвера, чтобы не нарваться
+# на устаревший локальный кэш; getent — запасной путь, он есть всегда.
+resolve_a() { # resolve_a <домен>
+    local d="$1" ips=""
+    if have dig; then
+        ips=$(dig +short +time=3 +tries=2 A "$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$')
+        [ -n "$ips" ] || ips=$(dig +short +time=3 +tries=2 A "$d" 2>/dev/null | grep -E '^[0-9.]+$')
+    fi
+    [ -n "$ips" ] || ips=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
+    printf '%s\n' "$ips" | grep -E '^[0-9.]+$' || true
+}
+
+# Проверка, что домен указывает на этот сервер (годится любая из его A-записей)
 domain_points_here() { # domain ipv4
-    local d="$1" ip="$2" resolved
-    have dig && resolved=$(dig +short A "$d" 2>/dev/null | tail -n1)
-    [ -n "${resolved:-}" ] || resolved=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1; exit}')
-    [ -n "${resolved:-}" ] && [ "$resolved" = "$ip" ]
+    local d="$1" ip="$2" ips
+    ips=$(resolve_a "$d")
+    [ -n "$ips" ] || return 1
+    printf '%s\n' "$ips" | grep -qx "$ip"
 }
