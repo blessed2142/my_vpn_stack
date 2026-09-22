@@ -115,35 +115,59 @@ ssh_ports() {
 
 svc_active() { systemctl is-active --quiet "$1"; }
 
-# Жив ли выход наружу: резолвинг имени и реальный HTTPS-запрос.
-net_sanity_check() {
-    local host="${1:-github.com}" i
+# Жив ли IP-уровень — без участия DNS. Отделять обязательно: сломанный
+# резолвинг не повод откатывать совершенно исправные правила firewall.
+ip_reachability_ok() {
+    local i
     for i in 1 2 3; do
-        if getent hosts "$host" >/dev/null 2>&1 \
-           && timeout 12 curl -fsS -o /dev/null "https://${host}" 2>/dev/null; then
-            return 0
-        fi
+        ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && return 0
+        timeout 8 curl -fsS -o /dev/null --max-time 6 https://1.1.1.1/ 2>/dev/null && return 0
         sleep 2
     done
     return 1
 }
 
-# Если резолвинг сломан, а resolv.conf пуст или указывает в никуда —
-# подставляем публичные резолверы, иначе сервер не починить без консоли.
+dns_ok() { getent hosts "${1:-github.com}" >/dev/null 2>&1; }
+
+# Жив ли выход наружу целиком: резолвинг имени и реальный HTTPS-запрос.
+net_sanity_check() {
+    local host="${1:-github.com}" i
+    for i in 1 2 3; do
+        dns_ok "$host" && timeout 12 curl -fsS -o /dev/null "https://${host}" 2>/dev/null && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# Чиним резолвинг. При systemd-resolved — через drop-in: /etc/resolv.conf там
+# лишь ссылка на сгенерированный файл, и запись в него либо бесполезна, либо
+# ломает конфигурацию resolved.
 ensure_dns() {
-    getent hosts github.com >/dev/null 2>&1 && return 0
-    warn "DNS не резолвит имена. Проверяю /etc/resolv.conf..."
-    if [ -L /etc/resolv.conf ] && systemctl is-active --quiet systemd-resolved; then
-        warn "resolv.conf под управлением systemd-resolved — трогать не буду."
-        return 1
+    dns_ok && return 0
+    warn "DNS не резолвит имена — пытаюсь починить."
+
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        log "Прописываю публичные резолверы для systemd-resolved..."
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > /etc/systemd/resolved.conf.d/99-vpnstack.conf <<'RSLV'
+# vpnstack: резервные резолверы, чтобы сервер не остался без DNS
+[Resolve]
+DNS=1.1.1.1 8.8.8.8 2606:4700:4700::1111
+FallbackDNS=9.9.9.9 1.0.0.1
+RSLV
+        systemctl restart systemd-resolved 2>/dev/null || true
+        sleep 2
+        if dns_ok; then ok "DNS заработал (systemd-resolved)."; return 0; fi
+        warn "systemd-resolved всё ещё не резолвит."
     fi
-    cp -a /etc/resolv.conf /etc/resolv.conf.vpnstack-bak 2>/dev/null || true
-    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-    if getent hosts github.com >/dev/null 2>&1; then
-        ok "Добавил публичные резолверы в /etc/resolv.conf — DNS заработал."
-        return 0
+
+    if [ ! -L /etc/resolv.conf ]; then
+        cp -a /etc/resolv.conf /etc/resolv.conf.vpnstack-bak 2>/dev/null || true
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+        if dns_ok; then ok "Добавил публичные резолверы в /etc/resolv.conf."; return 0; fi
     fi
-    err "DNS не заработал и с публичными резолверами — дело не в них."
+
+    err "DNS не удалось починить автоматически. Смотрите: vpnctl diag (раздел «Сеть»)."
     return 1
 }
 

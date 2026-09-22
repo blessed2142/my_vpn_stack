@@ -93,6 +93,7 @@ fi
 . "$VPNSTACK_DIR/lib/render.sh"
 . "$VPNSTACK_DIR/lib/links.sh"
 . "$VPNSTACK_DIR/lib/cert.sh"
+. "$VPNSTACK_DIR/lib/clients.sh"
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 clients_init
@@ -133,6 +134,7 @@ state_set HY2_INSECURE_FORCE "$HY2_INSECURE_ARG"
 state_set CLIENT_DNS4 "${CLIENT_DNS4:-1.1.1.1}"
 state_set CLIENT_DNS6 "${CLIENT_DNS6:-2606:4700:4700::1111}"
 state_set TAG_PREFIX "${TAG_PREFIX:-$(hostname -s 2>/dev/null || echo vpn)}"
+state_set FIRST_CLIENT "$FIRST_CLIENT"
 
 if [ -n "$ENDPOINT_ARG" ]; then
     state_set ENDPOINT "$ENDPOINT_ARG"

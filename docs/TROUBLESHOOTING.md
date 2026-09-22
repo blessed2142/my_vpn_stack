@@ -16,15 +16,36 @@ getent hosts github.com
 ip -6 route show default      # пусто, а раньше был -> см. accept_ra ниже
 ```
 
-**Не резолвятся имена, IP пингуется.** Проверьте `/etc/resolv.conf`. Если он
-пуст или ведёт в никуда:
+**Не резолвятся имена, IP пингуется.** Смотрите, кто управляет резолвингом:
+
+```bash
+readlink -f /etc/resolv.conf
+systemctl is-active systemd-resolved
+resolvectl status | head -20
+```
+
+Если работает **systemd-resolved** (обычный случай для Debian 12), писать в
+`/etc/resolv.conf` бесполезно — это ссылка на генерируемый файл. Резолверы
+задаются через drop-in:
+
+```bash
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/99-vpnstack.conf <<'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8 2606:4700:4700::1111
+FallbackDNS=9.9.9.9 1.0.0.1
+EOF
+systemctl restart systemd-resolved
+getent hosts github.com
+```
+
+Если resolved не используется и `/etc/resolv.conf` — обычный файл:
 
 ```bash
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 ```
 
-Если файл — симлинк на systemd-resolved, чините сам resolved:
-`systemctl restart systemd-resolved`.
+Установщик делает это сам (`ensure_dns`) перед установкой пакетов.
 
 **Пропал только IPv6.** Включение `net.ipv6.conf.all.forwarding=1` (нужно для
 VPN) заставляет ядро игнорировать Router Advertisement, и на серверах со SLAAC

@@ -7,6 +7,7 @@ VPNSTACK_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
 . "$VPNSTACK_DIR/lib/render.sh"
 . "$VPNSTACK_DIR/lib/links.sh"
 . "$VPNSTACK_DIR/lib/cert.sh"
+. "$VPNSTACK_DIR/lib/clients.sh"
 
 require_root
 detect_os
@@ -35,52 +36,13 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
 USAGE
 }
 
-next_awg_index() {
-    local used max=1 i
-    used=$(jq -r '.clients[]? | .awg_ip4 // empty' "$CLIENTS_FILE" | awk -F. '{print $4}')
-    for i in $used; do [ "$i" -gt "$max" ] && max="$i"; done
-    echo $((max + 1))
-}
-
-# Создаёт запись клиента. Второй аргумент — готовый пароль Hysteria
-# (используется при импорте старого конфига), иначе генерируется новый.
-client_create() { # client_create ИМЯ [HY2_PASS]
-    local name="$1" forced_hy2="${2:-}"
-    local uuid hy2p priv pub psk idx ip4 ip6
-    uuid=$( [ -n "${REALITY_PRIVATE_KEY:-}" ] && (have xray && xray uuid || cat /proc/sys/kernel/random/uuid) || echo "" )
-    if [ -n "$forced_hy2" ]; then
-        hy2p="$forced_hy2"
-    else
-        hy2p=$( [ -n "${HY2_PORT:-}" ] && [ "${HY2_MANAGED:-1}" = "1" ] && rand_pass || echo "" )
-    fi
-    if [ -n "${AWG_PUBLIC_KEY:-}" ]; then
-        priv=$(awg genkey); pub=$(printf '%s' "$priv" | awg pubkey); psk=$(awg genpsk)
-        idx=$(next_awg_index)
-        [ "$idx" -le 254 ] || die "Свободные адреса в подсети AmneziaWG закончились."
-        ip4="${AWG_NET4_PREFIX}.${idx}"
-        ip6="${AWG_NET6_PREFIX}::${idx}"
-    fi
-
-    jq --arg n "$name" --arg uuid "$uuid" --arg hy2 "$hy2p" \
-       --arg priv "${priv:-}" --arg pub "${pub:-}" --arg psk "${psk:-}" \
-       --arg ip4 "${ip4:-}" --arg ip6 "${ip6:-}" --arg ts "$(date -Is)" '
-        .clients[$n] = ({created: $ts}
-          + (if $uuid != "" then {uuid: $uuid} else {} end)
-          + (if $hy2  != "" then {hy2_pass: $hy2} else {} end)
-          + (if $pub  != "" then {awg_priv: $priv, awg_pub: $pub, awg_psk: $psk,
-                                  awg_ip4: $ip4, awg_ip6: $ip6} else {} end))
-       ' "$CLIENTS_FILE" | clients_write
-}
-
-valid_name() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; }
-
 cmd_add() {
     local name="${1:-}"; shift || true
     [ -n "$name" ] || die "Укажите имя: vpnctl add <имя>"
     valid_name "$name" || die "Имя: латиница/цифры/._- до 32 символов."
     client_exists "$name" && die "Клиент '$name' уже существует."
 
-    client_create "$name"
+    provision_client "$name"
     render_all; reload_all
     ok "Клиент '$name' создан."
     state_load
@@ -176,6 +138,73 @@ cmd_tls_acme() {
 }
 
 # Аварийный выключатель: если правила отрезали сервер, чинить надо быстро.
+cmd_import_hysteria() { # cmd_import_hysteria ФАЙЛ
+    local f="${1:-}"
+    if [ -z "$f" ]; then
+        f=$(ls -1t /etc/hysteria/config.yaml.manual-* 2>/dev/null | head -n1)
+        [ -n "$f" ] || die "Укажите файл: vpnctl import-hysteria /etc/hysteria/config.yaml.manual-<дата>"
+        log "Беру самый свежий бэкап: $f"
+    fi
+    [ -s "$f" ] || die "Файл не найден: $f"
+    [ "${HY2_MANAGED:-1}" = "1" ] || die "Hysteria в режиме --keep-hysteria, импортировать некуда."
+
+    local obfs port users n pw added=0 updated=0
+    obfs=$(hy2_parse_obfs "$f"); port=$(hy2_parse_port "$f"); users=$(hy2_parse_users "$f")
+
+    hdr "Импорт из $f"
+    [ -n "$port" ] && printf '  порт в старом конфиге : UDP/%s (сейчас UDP/%s)\n' "$port" "${HY2_PORT:-?}"
+    [ -n "$users" ] || die "В файле нет блока auth.userpass — импортировать нечего."
+    if [ -n "$obfs" ]; then
+        echo "  пароль обфускации     : найден"
+        state_set HY2_OBFS_PASS "$obfs"
+    else
+        echo "  пароль обфускации     : не найден (обфускация была выключена?)"
+        state_set HY2_OBFS_PASS ""
+    fi
+
+    while IFS=$'\t' read -r n pw; do
+        [ -n "$n" ] || continue
+        valid_name "$n" || { warn "Пропускаю '$n': недопустимое имя."; continue; }
+        client_exists "$n" && updated=$((updated + 1)) || added=$((added + 1))
+        provision_client "$n" "$pw"
+    done <<< "$users"
+
+    state_load
+    render_all; reload_all
+    ok "Импортировано: новых ${added}, обновлено ${updated}."
+
+    if [ -n "$port" ] && [ "$port" != "${HY2_PORT:-}" ]; then
+        warn "Порт отличается: старый UDP/${port}, сейчас UDP/${HY2_PORT}."
+        warn "Чтобы старые ссылки заработали полностью, переустановите с этим портом:"
+        warn "  cd /opt/vpnstack && ./install.sh --only base,hysteria --hy2-port ${port}"
+    else
+        ok "Порт совпадает — старые ссылки Hysteria должны заработать как раньше."
+    fi
+    warn "Сертификат тоже должен совпасть: ссылки с insecure=1 не подойдут к Let's Encrypt и наоборот."
+}
+
+cmd_dns() {
+    local d="${1:-${HY2_DOMAIN:-}}"
+    [ -n "$d" ] || die "Укажите домен: vpnctl dns <домен>"
+    hdr "DNS: $d"
+    local ips; ips=$(resolve_a "$d")
+    if [ -z "$ips" ]; then
+        err "Домен не резолвится. Либо A-записи нет, либо на сервере сломан DNS."
+        return 1
+    fi
+    printf '  A-записи      : %s\n' "$(printf '%s' "$ips" | tr '\n' ' ')"
+    printf '  этот сервер   : %s\n' "${SERVER_IP4:-?}"
+    if printf '%s\n' "$ips" | grep -qx "${SERVER_IP4:-нет}"; then
+        ok "Совпадает — можно выдавать сертификат Let's Encrypt."
+        if [ "${HY2_TLS_MODE:-}" = "selfsigned" ]; then
+            warn "Сейчас стоит самоподписанный. Переключить: vpnctl tls-acme $d <email>"
+        fi
+    else
+        warn "Не совпадает: домен ведёт на другой сервер, либо DNS ещё не разошёлся."
+    fi
+    return 0
+}
+
 cmd_firewall() {
     case "${1:-}" in
         off)
@@ -220,8 +249,12 @@ cmd_diag() {
 
     hdr "Сеть"
     printf '  resolv.conf (%s):\n' "$(readlink -f /etc/resolv.conf 2>/dev/null || echo '?')"
-    sed 's/^/    /' /etc/resolv.conf 2>/dev/null | head -n 6 || true
+    grep -vE '^[[:space:]]*(#|$)' /etc/resolv.conf 2>/dev/null | sed 's/^/    /' | head -n 8 \
+        || echo "    (пусто — резолверов нет)"
     printf '  systemd-resolved: %s\n' "$(systemctl is-active systemd-resolved 2>/dev/null)"
+    if have resolvectl; then
+        resolvectl status 2>/dev/null | grep -E 'Current DNS|DNS Servers|Fallback|Link [0-9]' | sed 's/^/    /' | head -n 10 || true
+    fi
     printf '  маршрут v4: %s\n' "$(ip -4 route show default 2>/dev/null | head -n1)"
     printf '  маршрут v6: %s\n' "$(ip -6 route show default 2>/dev/null | head -n1)"
     printf '  accept_ra : all=%s default=%s | forwarding v6=%s\n' \

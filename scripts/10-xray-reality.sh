@@ -62,6 +62,9 @@ if [ -z "${REALITY_PRIVATE_KEY:-}" ]; then
     ok "Ключи REALITY сгенерированы."
 fi
 
+# Конфиг генерируется из списка клиентов — он должен быть непустым.
+provision_client "${FIRST_CLIENT:-main}"
+
 # --------------------------------------------------------------- конфиг
 render_xray
 xray run -test -config "$XRAY_CONF" >/dev/null 2>&1 || {

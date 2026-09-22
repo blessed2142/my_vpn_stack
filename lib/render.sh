@@ -71,6 +71,13 @@ render_hysteria() {
         log "Hysteria2 под вашим ручным управлением — конфиг не трогаю."
         return 0
     fi
+    # Пустой auth.userpass -> "invalid config: empty auth userpass", и сервис
+    # не поднимется вовсе. Ловим это до записи конфига, а не по факту падения.
+    local nusers
+    nusers=$(jq '[.clients[]? | select(.hy2_pass != null)] | length' "$CLIENTS_FILE" 2>/dev/null || echo 0)
+    [ "${nusers:-0}" -gt 0 ] \
+        || die "У Hysteria нет ни одного пользователя — она не запустится. Заведите клиента: vpnctl add <имя>"
+
     case "${HY2_TLS_MODE:-selfsigned}" in
         custom) [ -n "${HY2_CERT:-}" ] && [ -n "${HY2_KEY:-}" ] \
                     || die "HY2_TLS_MODE=custom, но HY2_CERT/HY2_KEY не заданы." ;;

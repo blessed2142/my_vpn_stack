@@ -96,6 +96,9 @@ case "$HY2_TLS_MODE" in
     custom)     state_set HY2_INSECURE "${HY2_INSECURE_FORCE:-0}" ;;
 esac
 
+# Hysteria с пустым auth.userpass не стартует вообще — клиент нужен до рендера.
+provision_client "${FIRST_CLIENT:-main}"
+
 # --------------------------------------------------------------- запуск
 render_hysteria
 systemctl enable hysteria-server >/dev/null 2>&1 || true

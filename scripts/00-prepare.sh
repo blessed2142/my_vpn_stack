@@ -128,10 +128,10 @@ NFT
         systemctl enable nftables >/dev/null 2>&1 || true
         systemctl restart nftables
         # Правило, отрезавшее сервер от сети, чинить потом по SSH уже нечем.
-        if net_sanity_check; then
+        if ip_reachability_ok; then
             ok "Firewall включён (открыты: SSH ${sshp}, 80/tcp, ${VLESS_PORT:-443}/tcp, ${HY2_PORT:-443}/udp, ${awgport}/udp)."
         else
-            err "После включения firewall пропала связь наружу — откатываю правила."
+            err "После включения firewall пропал доступ к сети по IP — откатываю правила."
             nft flush ruleset 2>/dev/null || true
             if [ -f /etc/nftables.conf.vpnstack-bak ]; then
                 cp /etc/nftables.conf.vpnstack-bak /etc/nftables.conf
