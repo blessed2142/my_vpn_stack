@@ -97,6 +97,7 @@ fi
 . "$VPNSTACK_DIR/lib/cert.sh"
 . "$VPNSTACK_DIR/lib/clients.sh"
 . "$VPNSTACK_DIR/lib/probe.sh"
+. "$VPNSTACK_DIR/lib/firewall.sh"
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 clients_init
@@ -175,6 +176,21 @@ run_part base     && . "$VPNSTACK_DIR/scripts/00-prepare.sh"
 run_part xray     && . "$VPNSTACK_DIR/scripts/10-xray-reality.sh"
 run_part hysteria && . "$VPNSTACK_DIR/scripts/20-hysteria2.sh"
 run_part awg      && . "$VPNSTACK_DIR/scripts/30-amneziawg.sh"
+
+# Порт мог смениться, а этап base — не запускаться (--only xray). Тогда Xray
+# слушает один порт, а firewall пропускает другой: снаружи это выглядит как
+# полностью мёртвый сервер, хотя сам сервер подключается к себе нормально
+# (трафик к самому себе идёт через lo и правила портов не проверяет).
+if [ "${SETUP_FIREWALL:-1}" = "1" ] && ! run_part base; then
+    if check_port_allowed "$VLESS_PORT" tcp >/dev/null 2>&1 \
+       && check_port_allowed "$HY2_PORT" udp >/dev/null 2>&1 \
+       && check_port_allowed "$AWG_PORT" udp >/dev/null 2>&1; then
+        :
+    else
+        warn "Правила firewall не совпадают с текущими портами — перегенерирую."
+        setup_firewall || warn "Не удалось обновить правила — проверьте: vpnctl firewall status"
+    fi
+fi
 
 # ------------------------------------------------------------------ vpnctl
 install -m 0755 "$VPNSTACK_DIR/bin/vpnctl" /usr/local/bin/vpnctl

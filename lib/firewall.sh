@@ -90,3 +90,33 @@ NFT
     fi
 }
 
+
+# Слушающий порт и разрешённый в firewall должны совпадать. Разъезжаются они
+# легко: например, порт меняли через ./install.sh --only xray, а правила
+# остались от прошлого запуска. Снаружи это выглядит как "сервер не отвечает",
+# при том что сам сервер подключается к себе нормально — трафик к самому себе
+# идёт через lo и правила портов не проверяет.
+check_port_allowed() { # check_port_allowed ПОРТ [tcp|udp]
+    local port="$1" proto="${2:-tcp}"
+    if ! nft list chain inet filter input >/dev/null 2>&1; then
+        log "  nftables не настроен — правила не мешают."
+        return 0
+    fi
+    local dports
+    dports=$(nft list chain inet filter input 2>/dev/null \
+        | grep -oE "${proto} dport [{ ]*[0-9, ]+" \
+        | sed "s/${proto} dport//" | tr -d '{ ' | tr ',' '\n' | grep -E '^[0-9]+$' | sort -u)
+    if printf '%s\n' "$dports" | grep -qx "$port"; then
+        ok "  firewall: ${proto}/${port} разрешён"
+        return 0
+    fi
+    err "  firewall: ${proto}/${port} НЕ разрешён — входящие соединения отбрасываются."
+    echo "      Починить:  vpnctl firewall sync"
+    return 1
+}
+
+# Перегенерирует правила под текущие порты из состояния.
+sync_firewall() {
+    setup_firewall || return 1
+    return 0
+}

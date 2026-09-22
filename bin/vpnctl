@@ -40,7 +40,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl set-port <порт>      перенести VLESS на другой порт (если душат 443)
   vpnctl capture [порт] [сек] посмотреть, доходят ли TLS-приветствия до сервера
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
-  vpnctl firewall on|off|status   аварийно включить/выключить nftables
+  vpnctl firewall on|off|status|sync  правила nftables (sync — под текущие порты)
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
   vpnctl import-hysteria [файл]   забрать пользователей и пароль обфускации
                               из конфига Hysteria, настроенного вручную
@@ -426,7 +426,18 @@ cmd_selftest() {
         return 1
     fi
 
-    hdr "2. Внешний канал сервера"
+    # Проверка через ENDPOINT идёт к собственному публичному адресу, а такой
+    # трафик возвращается через lo и правила портов не проходит. Поэтому
+    # закрытый снаружи порт selftest сам по себе не заметит — сверяем отдельно.
+    hdr "2. Порт открыт снаружи"
+    check_port_allowed "${VLESS_PORT:-443}" tcp || {
+        echo
+        echo "      Именно так выглядит полностью мёртвый сервер снаружи при"
+        echo "      исправном Xray. Починить:  vpnctl firewall sync"
+        return 1
+    }
+
+    hdr "3. Внешний канал сервера"
     local base
     base=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$PROBE_URL" 2>/dev/null) || base=""
     if [ "$base" = "204" ] || [ "$base" = "200" ]; then
@@ -436,7 +447,7 @@ cmd_selftest() {
         return 1
     fi
 
-    hdr "3. Маскировочный сайт ${REALITY_SNI}"
+    hdr "4. Маскировочный сайт ${REALITY_SNI}"
     if timeout 15 openssl s_client -connect "${REALITY_SNI}:443" -servername "${REALITY_SNI}" \
          -alpn h2 -tls1_3 </dev/null 2>/dev/null | grep -q 'ALPN protocol: h2'; then
         ok "  доступен, отдаёт TLS 1.3 + h2"
@@ -446,7 +457,7 @@ cmd_selftest() {
         return 1
     fi
 
-    hdr "4. Подключение настоящим клиентом"
+    hdr "5. Подключение настоящим клиентом"
     local lo=0 ext=0
     _selftest_vless "127.0.0.1" "через loopback (только протокол)" && lo=1
     _selftest_vless "${ENDPOINT}" "через ${ENDPOINT} (протокол + сеть)" && ext=1
@@ -561,26 +572,36 @@ cmd_capture() {
     echo "  Ловлю ${secs} секунд. ПРЯМО СЕЙЧАС попробуйте подключиться с устройства."
     timeout "$secs" tcpdump -i any -nn -s 0 -w "$f" "tcp port ${port}" >/dev/null 2>&1 || true
 
-    local total syn hello
+    local total syn synack hello
     total=$(tcpdump -r "$f" -nn 2>/dev/null | wc -l)
     syn=$(tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null | wc -l)
+    synack=$(tcpdump -r "$f" -nn 'tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)' 2>/dev/null | wc -l)
     hello=$(tcpdump -r "$f" -nn 'tcp[((tcp[12:1] & 0xf0) >> 2)] = 0x16' 2>/dev/null | wc -l)
 
     hdr "Итог"
-    printf '  пакетов всего            : %s\n' "$total"
-    printf '  попыток соединения (SYN) : %s\n' "$syn"
-    printf '  TLS-приветствий          : %s\n' "$hello"
+    printf '  пакетов всего               : %s\n' "$total"
+    printf '  попыток соединения (SYN)    : %s\n' "$syn"
+    printf '  ответов сервера (SYN-ACK)   : %s\n' "$synack"
+    printf '  TLS-приветствий             : %s\n' "$hello"
 
     hdr "Кто подключался"
     tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null \
-        | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/    /'
+        | awk '{for(i=1;i<=NF;i++) if($i==">"){print $(i-1); break}}' \
+        | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/    /'
 
     hdr "Что это значит"
     if [ "$syn" -eq 0 ]; then
         echo "  До сервера не дошло ни одной попытки соединения."
         echo "  Трафик режут по дороге либо клиент идёт не на этот адрес/порт."
+    elif [ "$synack" -eq 0 ]; then
+        err "  Попытки приходят, но сервер НЕ ОТВЕЧАЕТ на них."
+        echo "  Соединение не устанавливается вовсе — TLS тут ещё и не начинался."
+        echo "  Так бывает, когда порт закрыт правилами firewall или на нём никто"
+        echo "  не слушает. Проверка ниже."
+        echo
+        check_port_allowed "$port"
     elif [ "$hello" -eq 0 ]; then
-        echo "  Соединения открываются, но TLS-приветствие не приходит НИ ОДНО."
+        echo "  Соединения устанавливаются, но TLS-приветствие не приходит НИ ОДНО."
         echo "  Клиент либо ничего не отправляет, либо его пакет теряется по пути."
         echo "  Первые байты того, что всё-таки пришло:"
         tcpdump -r "$f" -nn -A -c 3 'tcp[tcpflags] & tcp-push != 0' 2>/dev/null | head -n 20 | sed 's/^/    /'
@@ -634,9 +655,19 @@ cmd_firewall() {
             nft -f /etc/nftables.conf || die "Правила не применились."
             systemctl start nftables 2>/dev/null || true
             ok "Firewall включён." ;;
+        sync)
+            setup_firewall || die "Не удалось применить правила."
+            ok "Правила перегенерированы под текущие порты."
+            check_port_allowed "${VLESS_PORT:-443}" tcp
+            check_port_allowed "${HY2_PORT:-443}" udp
+            check_port_allowed "${AWG_PORT:-51820}" udp ;;
         status|"")
+            check_port_allowed "${VLESS_PORT:-443}" tcp || true
+            check_port_allowed "${HY2_PORT:-443}" udp || true
+            check_port_allowed "${AWG_PORT:-51820}" udp || true
+            echo
             nft list ruleset 2>/dev/null | head -n 40 || echo "  правил нет" ;;
-        *) die "Использование: vpnctl firewall on|off|status" ;;
+        *) die "Использование: vpnctl firewall on|off|status|sync" ;;
     esac
 }
 
