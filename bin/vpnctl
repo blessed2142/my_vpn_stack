@@ -8,6 +8,7 @@ VPNSTACK_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
 . "$VPNSTACK_DIR/lib/links.sh"
 . "$VPNSTACK_DIR/lib/cert.sh"
 . "$VPNSTACK_DIR/lib/clients.sh"
+. "$VPNSTACK_DIR/lib/probe.sh"
 
 require_root
 detect_os
@@ -34,6 +35,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl fix-keys             привести ключи REALITY в соответствие друг другу
   vpnctl probe                перебрать маскировочные сайты и отпечатки TLS
   vpnctl set-fp <отпечаток>   сменить отпечаток TLS в ссылках
+  vpnctl set-sni <домен>      сменить маскировочный домен (с проверкой) и выдать ссылки
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -266,12 +268,29 @@ cmd_debug() {
             hdr "Что это значит"
             if [ ! -s "$elog" ]; then
                 echo "  Логов нет. Включите отладку (vpnctl debug on) и повторите попытку."
+            elif grep -q 'server name mismatch' "$elog"; then
+                echo "  Найдено: REALITY ... server name mismatch"
+                echo
+                echo "  Клиент прислал не тот маскировочный домен — ссылка устарела."
+                echo "  Сервер сейчас ждёт: ${REALITY_SNI:-?}"
+                echo "  Переимпортируйте ссылку на устройстве:  vpnctl show <имя> --qr"
+                echo
+                echo "  (строки с чужими доменами от посторонних адресов — это интернет-сканеры,"
+                echo "   их можно игнорировать: сервер отвечает им как обычный сайт)"
+            elif grep -q 'handshake did not complete successfully' "$elog"; then
+                echo "  Найдено: REALITY ... handshake did not complete successfully"
+                echo
+                echo "  Приветствие прочитано, но обмен с маскировочным сайтом сорвался."
+                echo "  Обычно сайт не годится для REALITY. Подобрать рабочий:"
+                echo "      vpnctl probe"
             elif grep -q 'failed to read client hello' "$elog"; then
                 echo "  Найдено: REALITY ... failed to read client hello"
                 echo
                 echo "  Пакеты от клиента ДОХОДЯТ — сеть и firewall ни при чём."
-                echo "  Но клиент не прислал TLS-приветствие: приложение не включило REALITY."
-                echo "  Почти всегда это неполный импорт ссылки. Что делать:"
+                echo "  Но TLS-приветствие не пришло. Если это единичные записи от вашего"
+                echo "  адреса — скорее всего приложение просто меряло задержку (открыло"
+                echo "  соединение и закрыло). Смотрите, есть ли РЯДОМ записи об успешном"
+                echo "  подключении; если их нет, проверьте импорт ссылки:"
                 echo "    1) импортировать по QR-коду, а не копированием текста:"
                 echo "         vpnctl show <имя> --qr"
                 echo "    2) проверить в приложении поля:"
@@ -299,7 +318,6 @@ cmd_debug() {
 # Поднимает на сервере настоящий клиент Xray и ходит через него наружу.
 # Разводит: испорченные ключи, недоступный маскировочный сайт, мёртвый
 # внешний канал, сломанный сетевой путь и проблему в приложении.
-_TEST_URL="https://cp.cloudflare.com/generate_204"
 
 _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
     local addr="$1" label="$2" tmp pid code port=10809
@@ -329,7 +347,7 @@ _selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
     pid=$!
     sleep 2
     code=$(timeout 30 curl -s -o /dev/null -w '%{http_code}' \
-           --proxy "socks5h://127.0.0.1:${port}" --max-time 25 "$_TEST_URL" 2>/dev/null) || code=""
+           --proxy "socks5h://127.0.0.1:${port}" --max-time 25 "$PROBE_URL" 2>/dev/null) || code=""
     [ -n "$code" ] || code="000"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -389,7 +407,7 @@ cmd_selftest() {
 
     hdr "2. Внешний канал сервера"
     local base
-    base=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$_TEST_URL" 2>/dev/null) || base=""
+    base=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$PROBE_URL" 2>/dev/null) || base=""
     if [ "$base" = "204" ] || [ "$base" = "200" ]; then
         ok "  сервер сам ходит в интернет (HTTP ${base})"
     else
@@ -450,62 +468,16 @@ cmd_fix_keys() {
     warn "Ссылки VLESS изменились — раздайте заново: vpnctl links --qr"
 }
 
-# Поднимает временную пару сервер+клиент REALITY на свободных портах и
-# проверяет, проходит ли через неё трафик. Рабочий сервис при этом не трогается.
-_probe_pair() { # _probe_pair МАСКИРОВОЧНЫЙ_ДОМЕН ОТПЕЧАТОК
-    local dest="$1" fp="$2" tmp k priv pub sid uuid code
-    local sport=18443 cport=18080
-    k=$(xray x25519 2>/dev/null)
-    priv=$(grep -iE '^[[:space:]]*private' <<<"$k" | head -n1 | sed 's/.*:[[:space:]]*//')
-    pub=$(grep -iE '^[[:space:]]*(public|password)' <<<"$k" | head -n1 | sed 's/.*:[[:space:]]*//')
-    sid=$(rand_hex 8); uuid=$(xray uuid)
-    tmp=$(mktemp -d)
-
-    jq -n --arg dest "${dest}:443" --arg sni "$dest" --arg priv "$priv" --arg sid "$sid" \
-          --arg uuid "$uuid" --argjson port "$sport" '{
-        log: { loglevel: "error" },
-        inbounds: [{ listen: "127.0.0.1", port: $port, protocol: "vless",
-          settings: { clients: [{ id: $uuid, flow: "xtls-rprx-vision" }], decryption: "none" },
-          streamSettings: { network: "tcp", security: "reality",
-            realitySettings: { show: false, dest: $dest, xver: 0, serverNames: [$sni],
-                               privateKey: $priv, shortIds: [$sid] } } }],
-        outbounds: [{ protocol: "freedom" }] }' > "$tmp/s.json"
-
-    jq -n --arg sni "$dest" --arg fp "$fp" --arg pub "$pub" --arg sid "$sid" \
-          --arg uuid "$uuid" --argjson sport "$sport" --argjson cport "$cport" '{
-        log: { loglevel: "error" },
-        inbounds: [{ listen: "127.0.0.1", port: $cport, protocol: "socks",
-                     settings: { udp: false } }],
-        outbounds: [{ protocol: "vless",
-          settings: { vnext: [{ address: "127.0.0.1", port: $sport,
-            users: [{ id: $uuid, encryption: "none", flow: "xtls-rprx-vision" }] }] },
-          streamSettings: { network: "tcp", security: "reality",
-            realitySettings: { serverName: $sni, fingerprint: $fp,
-                               publicKey: $pub, shortId: $sid } } }] }' > "$tmp/c.json"
-
-    xray run -c "$tmp/s.json" >"$tmp/s.log" 2>&1 & local sp=$!
-    sleep 1
-    xray run -c "$tmp/c.json" >"$tmp/c.log" 2>&1 & local cp=$!
-    sleep 1
-    code=$(timeout 25 curl -s -o /dev/null -w '%{http_code}' \
-           --proxy "socks5h://127.0.0.1:${cport}" --max-time 18 "$_TEST_URL" 2>/dev/null) || code=""
-    kill "$sp" "$cp" 2>/dev/null || true
-    wait "$sp" "$cp" 2>/dev/null || true
-    rm -rf "$tmp"
-    [ "$code" = "204" ] || [ "$code" = "200" ]
-}
-
 # Перебирает маскировочные сайты и отпечатки, чтобы найти рабочее сочетание.
 cmd_probe() {
     have xray || die "Xray не установлен."
     local d f ok_dest="" ok_fp=""
-    local dests="${REALITY_SNI} www.cloudflare.com one.one.one.one www.yahoo.com
-                 dl.google.com www.samsung.com www.lovelive-anime.jp"
+    local dests="${REALITY_SNI} ${REALITY_CANDIDATES}"
 
     hdr "Перебор маскировочных сайтов (отпечаток chrome)"
     for d in $dests; do
         printf '  %-28s ' "$d"
-        if _probe_pair "$d" chrome; then
+        if probe_reality "$d" chrome; then
             printf '%sработает%s\n' "$C_GRN" "$C_OFF"
             [ -z "$ok_dest" ] && ok_dest="$d"
         else
@@ -516,7 +488,7 @@ cmd_probe() {
     hdr "Перебор отпечатков на ${REALITY_SNI}"
     for f in chrome firefox safari ios edge random; do
         printf '  %-28s ' "$f"
-        if _probe_pair "${REALITY_SNI}" "$f"; then
+        if probe_reality "${REALITY_SNI}" "$f"; then
             printf '%sработает%s\n' "$C_GRN" "$C_OFF"
             [ -z "$ok_fp" ] && ok_fp="$f"
         else
@@ -538,6 +510,22 @@ cmd_probe() {
         echo "  Не сработало ни одно сочетание: REALITY на этом сервере не поднимается."
         echo "  Пришлите вывод, будем смотреть глубже."
     fi
+}
+
+# Смена маскировочного домена. Меняет и серверный конфиг, и ссылки — забыть
+# раздать новые нельзя, команда сама их печатает.
+cmd_set_sni() {
+    local d="${1:-}"
+    [ -n "$d" ] || die "Использование: vpnctl set-sni <домен>"
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "'$d' не похоже на доменное имя."
+    log "Проверяю ${d} живым рукопожатием REALITY..."
+    probe_reality "$d" "${REALITY_FP:-chrome}" || die "${d} не подходит для REALITY. Подобрать: vpnctl probe"
+    local prev="${REALITY_SNI}"
+    state_set REALITY_SNI "$d"
+    state_load; render_xray; systemctl restart xray
+    ok "Маскировочный домен: ${prev} -> ${d}"
+    warn "СТАРЫЕ ССЫЛКИ VLESS БОЛЬШЕ НЕ РАБОТАЮТ — переимпортируйте новые на всех устройствах."
+    cmd_links --qr
 }
 
 # Отпечаток TLS влияет только на клиента и живёт в ссылке.
@@ -680,6 +668,7 @@ case "${1:-}" in
     fix-keys) cmd_fix_keys ;;
     probe)   cmd_probe ;;
     set-fp)  shift; cmd_set_fp "${1:-}" ;;
+    set-sni) shift; cmd_set_sni "${1:-}" ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
