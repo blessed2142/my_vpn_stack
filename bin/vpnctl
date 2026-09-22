@@ -39,6 +39,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl set-sni <домен>      сменить маскировочный домен (с проверкой) и выдать ссылки
   vpnctl set-port <порт>      перенести VLESS на другой порт (если душат 443)
   vpnctl capture [порт] [сек] посмотреть, доходят ли TLS-приветствия до сервера
+  vpnctl set-mss <байт|off>   ограничить MSS, если по пути теряются крупные пакеты
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status|sync  правила nftables (sync — под текущие порты)
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -572,11 +573,17 @@ cmd_capture() {
     echo "  Ловлю ${secs} секунд. ПРЯМО СЕЙЧАС попробуйте подключиться с устройства."
     timeout "$secs" tcpdump -i any -nn -s 0 -w "$f" "tcp port ${port}" >/dev/null 2>&1 || true
 
+    # Фильтр "tcp port N" ловит и исходящие соединения сервера на чужой :443
+    # (REALITY ходит на маскировочный сайт) — считать надо строго то, что
+    # приходит К нам, и отдельно исключить собственные проверки с этого же IP.
+    local me="${SERVER_IP4}" inb outb
+    inb="dst host ${me} and dst port ${port} and not src host ${me}"
+    outb="src host ${me} and src port ${port}"
     local total syn synack hello
     total=$(tcpdump -r "$f" -nn 2>/dev/null | wc -l)
-    syn=$(tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null | wc -l)
-    synack=$(tcpdump -r "$f" -nn 'tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)' 2>/dev/null | wc -l)
-    hello=$(tcpdump -r "$f" -nn 'tcp[((tcp[12:1] & 0xf0) >> 2)] = 0x16' 2>/dev/null | wc -l)
+    syn=$(tcpdump -r "$f" -nn "${inb} and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null | wc -l)
+    synack=$(tcpdump -r "$f" -nn "${outb} and tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)" 2>/dev/null | wc -l)
+    hello=$(tcpdump -r "$f" -nn "${inb} and tcp[((tcp[12:1] & 0xf0) >> 2)] = 0x16" 2>/dev/null | wc -l)
 
     hdr "Итог"
     printf '  пакетов всего               : %s\n' "$total"
@@ -584,8 +591,8 @@ cmd_capture() {
     printf '  ответов сервера (SYN-ACK)   : %s\n' "$synack"
     printf '  TLS-приветствий             : %s\n' "$hello"
 
-    hdr "Кто подключался"
-    tcpdump -r "$f" -nn 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' 2>/dev/null \
+    hdr "Кто подключался (входящие, без собственных проверок)"
+    tcpdump -r "$f" -nn "${inb} and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i==">"){print $(i-1); break}}' \
         | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/    /'
 
@@ -602,16 +609,36 @@ cmd_capture() {
         check_port_allowed "$port"
     elif [ "$hello" -eq 0 ]; then
         echo "  Соединения устанавливаются, но TLS-приветствие не приходит НИ ОДНО."
-        echo "  Клиент либо ничего не отправляет, либо его пакет теряется по пути."
-        echo "  Первые байты того, что всё-таки пришло:"
-        tcpdump -r "$f" -nn -A -c 3 'tcp[tcpflags] & tcp-push != 0' 2>/dev/null | head -n 20 | sed 's/^/    /'
-        echo "    (пусто — значит не пришло ничего)"
+        echo
+        echo "  Размеры пришедших пакетов с данными:"
+        tcpdump -r "$f" -nn "${inb} and tcp[tcpflags] & tcp-push != 0" 2>/dev/null \
+            | grep -oE 'length [0-9]+' | sort -n -k2 | uniq -c | tail -n 8 | sed 's/^/    /'
+        echo "    (пусто — клиент не отправил вообще ничего)"
+        echo
+        echo "  Если пакеты с данными есть, но приветствия нет — оно приходит"
+        echo "  обрезанным. Обычно это потеря крупных пакетов по пути."
+        echo "  Лечится уменьшением MSS:  vpnctl set-mss 1360"
     else
         echo "  Приветствия ДОХОДЯТ (${hello} шт.) — провод в порядке."
         echo "  Значит их отвергает сам Xray: смотрите vpnctl debug log."
     fi
     echo
     echo "  Файл захвата: ${f}"
+}
+
+# Ограничение MSS для соединений к самому серверу. Нужно, когда по пути
+# теряются крупные пакеты: мелкое ходит, большое TLS-приветствие — нет.
+cmd_set_mss() {
+    local v="${1:-}"
+    case "$v" in
+        off|0|"") state_set MSS_CLAMP ""; log "MSS-ограничение снято." ;;
+        *[!0-9]*) die "Использование: vpnctl set-mss <536-1460|off>" ;;
+        *) [ "$v" -ge 536 ] && [ "$v" -le 1460 ] || die "Разумный диапазон: 536-1460."
+           state_set MSS_CLAMP "$v"; log "MSS для входящих соединений: ${v}." ;;
+    esac
+    state_load
+    setup_firewall || die "Не удалось применить правила."
+    ok "Готово. Переподключитесь с устройства и проверьте."
 }
 
 # Смена порта VLESS: конфиг, правила firewall и ссылки меняются вместе.
@@ -784,6 +811,7 @@ case "${1:-}" in
     set-sni) shift; cmd_set_sni "${1:-}" ;;
     set-port) shift; cmd_set_port "${1:-}" ;;
     capture) shift; cmd_capture "${1:-}" "${2:-45}" ;;
+    set-mss) shift; cmd_set_mss "${1:-}" ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;

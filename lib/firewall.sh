@@ -7,6 +7,17 @@ setup_firewall() {
     sshp=$(ssh_ports | tr ' ' ',' | sed 's/,$//')
     awgport="${AWG_PORT:-51820}"
 
+    # Клиент выбирает размер своих пакетов по MSS, которое сервер объявляет в
+    # SYN-ACK. Если по пути к серверу теряются крупные пакеты (битый PMTU у
+    # провайдера), большое TLS-приветствие не доходит целиком, а мелкие пакеты
+    # ходят нормально. Уменьшение MSS заставляет клиента резать приветствие.
+    local MSS_RULE=""
+    if [ -n "${MSS_CLAMP:-}" ]; then
+        MSS_RULE="        tcp flags syn / syn,rst tcp option maxseg size set ${MSS_CLAMP}
+"
+        log "MSS для входящих соединений ограничен до ${MSS_CLAMP}."
+    fi
+
     log "Настраиваю nftables (SSH порты: ${sshp})..."
     [ -f /etc/nftables.conf ] && [ ! -f /etc/nftables.conf.vpnstack-bak ] \
         && cp /etc/nftables.conf /etc/nftables.conf.vpnstack-bak
@@ -45,7 +56,7 @@ table inet filter {
 
     chain output {
         type filter hook output priority filter; policy accept;
-    }
+${MSS_RULE}    }
 }
 
 table inet nat {
