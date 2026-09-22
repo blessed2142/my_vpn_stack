@@ -91,6 +91,39 @@ vpnctl restart              перезапустить все сервисы
 vpnctl tls-acme <домен> <email>   перевести Hysteria2 на Let's Encrypt
 ```
 
+### Диагностика
+
+```
+vpnctl status                состояние сервисов, портов, пиров
+vpnctl diag                  подробная диагностика (секреты замаскированы)
+vpnctl selftest              подключиться к своему же VLESS настоящим клиентом
+vpnctl probe                 перебрать маскировочные сайты и отпечатки TLS
+vpnctl capture [порт] [сек]  доходят ли TLS-приветствия от клиента
+vpnctl debug on|off|log      подробные логи Xray с разбором типовых ошибок
+vpnctl firewall status|sync  сверить и перегенерировать правила под текущие порты
+vpnctl inspect [файл]        снимок ВСЕЙ конфигурации сервера в один файл
+```
+
+`inspect` работает и отдельно от vpnstack — на любом сервере, где VPN ставился
+каким угодно способом. Собирает систему, сеть, MTU, порты, firewall, sysctl,
+DNS, конфиги Xray/sing-box/Hysteria/WireGuard, панели (3x-ui, marzban),
+сертификаты и журналы. Секреты маскируются.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blessed2142/my_vpn_stack/claude/vpn-server-setup-7jpufu/inspect.sh | bash
+```
+
+Нужен, чтобы сравнить рабочую установку с нерабочей.
+
+### Настройка на ходу
+
+```
+vpnctl set-sni <домен>       сменить маскировочный домен (с проверкой)
+vpnctl set-fp <отпечаток>    сменить отпечаток TLS в ссылках
+vpnctl set-port <порт>       перенести VLESS на другой порт
+vpnctl set-mss <байт|off>    ограничить MSS, если теряются крупные пакеты
+```
+
 Конфиги клиентов сохраняются в `/etc/vpnstack/clients/<имя>/`:
 `vless-reality.txt`, `hysteria2.txt`, `amneziawg.conf`.
 

@@ -31,6 +31,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl diag                 полная диагностика для разбора проблем
+  vpnctl inspect [файл]       снимок всей конфигурации сервера в один файл
   vpnctl check-ports          доступны ли порты снаружи (кто виноват: хостер или клиент)
   vpnctl selftest             подключиться к своему же VLESS настоящим клиентом
   vpnctl fix-keys             привести ключи REALITY в соответствие друг другу
@@ -811,6 +812,7 @@ case "${1:-}" in
     set-sni) shift; cmd_set_sni "${1:-}" ;;
     set-port) shift; cmd_set_port "${1:-}" ;;
     capture) shift; cmd_capture "${1:-}" "${2:-45}" ;;
+    inspect) shift; bash "$VPNSTACK_DIR/inspect.sh" "${1:-}" ;;
     set-mss) shift; cmd_set_mss "${1:-}" ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;

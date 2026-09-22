@@ -89,7 +89,7 @@ log "Система: $OS_PRETTY ($(uname -r), $(uname -m))"
 # ------------------------------------------------------------- копируем себя
 if [ "$SELF_DIR" != "$VPNSTACK_DIR" ]; then
     mkdir -p "$VPNSTACK_DIR"
-    cp -a "$SELF_DIR"/{lib,scripts,bin,install.sh} "$VPNSTACK_DIR"/ 2>/dev/null || true
+    cp -a "$SELF_DIR"/{lib,scripts,bin,install.sh,inspect.sh} "$VPNSTACK_DIR"/ 2>/dev/null || true
 fi
 . "$VPNSTACK_DIR/lib/common.sh"
 . "$VPNSTACK_DIR/lib/render.sh"
