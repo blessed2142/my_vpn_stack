@@ -115,6 +115,23 @@ ssh_ports() {
 
 svc_active() { systemctl is-active --quiet "$1"; }
 
+# Ждёт, пока сервис не только «активен», но и реально занял свой порт.
+# Сервисы вроде hysteria стартуют мгновенно, а падают через пару секунд
+# (например, не получив сертификат), поэтому проверка сразу после restart врёт.
+wait_service_ready() { # wait_service_ready ЮНИТ tcp|udp ПОРТ [СЕКУНД]
+    local unit="$1" proto="$2" port="$3" t="${4:-25}" i=0 flag
+    [ "$proto" = "tcp" ] && flag="-lnt" || flag="-lnu"
+    while [ "$i" -lt "$t" ]; do
+        svc_active "$unit" || return 1
+        if ss -H $flag 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
+            sleep 2
+            svc_active "$unit" && return 0 || return 1
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
 # Все A-записи домена. dig спрашиваем у публичного резолвера, чтобы не нарваться
 # на устаревший локальный кэш; getent — запасной путь, он есть всегда.
 resolve_a() { # resolve_a <домен>

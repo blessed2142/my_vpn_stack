@@ -92,6 +92,7 @@ fi
 . "$VPNSTACK_DIR/lib/common.sh"
 . "$VPNSTACK_DIR/lib/render.sh"
 . "$VPNSTACK_DIR/lib/links.sh"
+. "$VPNSTACK_DIR/lib/cert.sh"
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 clients_init

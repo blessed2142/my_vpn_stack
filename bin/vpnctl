@@ -6,6 +6,7 @@ VPNSTACK_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
 . "$VPNSTACK_DIR/lib/common.sh"
 . "$VPNSTACK_DIR/lib/render.sh"
 . "$VPNSTACK_DIR/lib/links.sh"
+. "$VPNSTACK_DIR/lib/cert.sh"
 
 require_root
 detect_os
@@ -26,6 +27,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl restart              перезапустить все сервисы
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
+  vpnctl diag                 полная диагностика для разбора проблем
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
   vpnctl import-hysteria [файл]   забрать пользователей и пароль обфускации
                               из конфига Hysteria, настроенного вручную
@@ -150,15 +152,21 @@ INFO
 cmd_tls_acme() {
     local d="${1:-}" e="${2:-}"
     [ -n "$d" ] && [ -n "$e" ] || die "Использование: vpnctl tls-acme <домен> <email>"
-    domain_points_here "$d" "${SERVER_IP4}" || die "A-запись $d не указывает на ${SERVER_IP4}."
-    state_set HY2_DOMAIN "$d"; state_set HY2_SNI "$d"
-    state_set ACME_EMAIL "$e"; state_set HY2_TLS_MODE acme
-    mkdir -p /var/lib/hysteria/acme; chown -R hysteria:hysteria /var/lib/hysteria
-    state_set HY2_INSECURE 0
-    render_hysteria; systemctl restart hysteria-server; sleep 3
-    svc_active hysteria-server && ok "Hysteria2 переведена на Let's Encrypt ($d)." \
-        || die "Не запустилась. Логи: journalctl -u hysteria-server -n 50"
-    # раз домен теперь указывает сюда — подключаться лучше по имени, а не по IP
+    domain_points_here "$d" "${SERVER_IP4}" \
+        || die "A-записи $d ($(resolve_a "$d" | tr '\n' ' ')) не ведут на ${SERVER_IP4}."
+
+    systemctl stop hysteria-server 2>/dev/null || true
+    issue_certbot_cert "$d" "$e" || die "Сертификат получить не удалось."
+    adopt_certbot_cert "$d" || die "Сертификат выпущен, но скопировать не вышло."
+
+    state_set HY2_DOMAIN "$d"; state_set HY2_SNI "$d"; state_set ACME_EMAIL "$e"
+    state_set HY2_CERT /etc/hysteria/cert.pem; state_set HY2_KEY /etc/hysteria/key.pem
+    state_set HY2_TLS_MODE custom; state_set HY2_INSECURE 0
+
+    render_hysteria; systemctl restart hysteria-server
+    wait_service_ready hysteria-server udp "${HY2_PORT}" 25 \
+        || die "Не запустилась. Диагностика: vpnctl diag"
+    ok "Hysteria2 переведена на сертификат Let's Encrypt ($d)."
     if [ "${ENDPOINT:-}" = "${SERVER_IP4}" ]; then
         state_set ENDPOINT "$d"
         ok "Адрес подключения в ссылках переключён с ${SERVER_IP4} на ${d}."
@@ -166,96 +174,69 @@ cmd_tls_acme() {
     warn "Ссылки изменились — раздайте заново: vpnctl links"
 }
 
-# Достаёт из «ручного» конфига Hysteria пароль обфускации, порт и пользователей.
-hy2_parse_obfs() { # hy2_parse_obfs ФАЙЛ
-    awk '/^obfs:/{o=1;next} o&&/^[^[:space:]]/{o=0}
-         o&&/^[[:space:]]*password:/{s=$0
-            sub(/^[[:space:]]*password:[[:space:]]*/,"",s)
-            gsub(/^"|"$/,"",s); gsub(/^\047|\047$/,"",s)
-            print s; exit}' "$1"
-}
-hy2_parse_port() { # hy2_parse_port ФАЙЛ
-    awk -F: '/^[[:space:]]*listen:/{gsub(/[^0-9]/,"",$NF); print $NF; exit}' "$1"
-}
-hy2_parse_users() { # hy2_parse_users ФАЙЛ -> "имя<TAB>пароль"
-    awk '/^[[:space:]]*userpass:/{f=1;next} f&&/^[^[:space:]]/{f=0}
-         f&&/^[[:space:]]+[A-Za-z0-9_.-]+:/{
-            k=$0; sub(/:.*/,"",k); gsub(/[[:space:]]/,"",k)
-            v=$0; sub(/^[[:space:]]*[A-Za-z0-9_.-]+:[[:space:]]*/,"",v)
-            gsub(/^"|"$/,"",v); gsub(/^\047|\047$/,"",v)
-            if (k != "" && v != "") print k "\t" v}' "$1"
-}
+# Полный срез состояния для разбора проблем. Секреты замаскированы.
+cmd_diag() {
+    hdr "Система"
+    printf '  %s\n  ядро: %s  %s\n  дата: %s\n' \
+        "$(. /etc/os-release; echo "$PRETTY_NAME")" "$(uname -r)" "$(uname -m)" "$(date -Is)"
+    timedatectl 2>/dev/null | grep -Ei 'synchron|time zone' || true
 
-cmd_import_hysteria() { # cmd_import_hysteria ФАЙЛ
-    local f="${1:-}"
-    if [ -z "$f" ]; then
-        f=$(ls -1t /etc/hysteria/config.yaml.manual-* 2>/dev/null | head -n1)
-        [ -n "$f" ] || die "Укажите файл: vpnctl import-hysteria /etc/hysteria/config.yaml.manual-<дата>"
-        log "Беру самый свежий бэкап: $f"
-    fi
-    [ -s "$f" ] || die "Файл не найден: $f"
-    [ "${HY2_MANAGED:-1}" = "1" ] || die "Hysteria в режиме --keep-hysteria, импортировать некуда."
+    hdr "Версии"
+    printf '  xray        : %s\n' "$(xray version 2>/dev/null | head -n1 || echo нет)"
+    printf '  hysteria    : %s\n' "$(hysteria version 2>/dev/null | grep -i version | head -n1 || echo нет)"
+    printf '  awg         : %s\n' "$(awg --version 2>/dev/null | head -n1 || echo нет)"
+    printf '  amneziawg-go: %s\n' "$(command -v amneziawg-go || echo "нет (режим ядра)")"
+    printf '  certbot     : %s\n' "$(certbot --version 2>/dev/null || echo нет)"
 
-    local obfs port users n added=0 updated=0
-    obfs=$(hy2_parse_obfs "$f"); port=$(hy2_parse_port "$f"); users=$(hy2_parse_users "$f")
+    hdr "Сервисы"
+    local u
+    for u in xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; do
+        printf '  %-24s %s / %s\n' "$u" \
+            "$(systemctl is-active "$u" 2>/dev/null)" "$(systemctl is-enabled "$u" 2>/dev/null)"
+    done
 
-    hdr "Импорт из $f"
-    [ -n "$port" ] && printf '  порт в старом конфиге : UDP/%s (сейчас UDP/%s)\n' "$port" "${HY2_PORT:-?}"
-    [ -n "$obfs" ] && printf '  пароль обфускации     : найден\n' || printf '  пароль обфускации     : не найден (обфускация была выключена?)\n'
-    [ -n "$users" ] || die "В файле нет блока auth.userpass — импортировать нечего."
+    hdr "Слушающие порты"
+    ss -lntup 2>/dev/null | grep -vE '127\.0\.0\.1|\[::1\]' || true
 
-    if [ -n "$obfs" ]; then state_set HY2_OBFS_PASS "$obfs"; else state_set HY2_OBFS_PASS ""; fi
+    hdr "Состояние (секреты скрыты)"
+    sed -E "s/^(REALITY_PRIVATE_KEY|AWG_PRIVATE_KEY|HY2_OBFS_PASS)=.*/\1='***'/" \
+        "$STATE_FILE" 2>/dev/null || echo "  нет $STATE_FILE"
+    printf '  клиентов: %s\n' "$(jq -r '.clients|length' "$CLIENTS_FILE" 2>/dev/null || echo 0)"
 
-    while IFS=$'\t' read -r n pw; do
-        [ -n "$n" ] || continue
-        if ! valid_name "$n"; then
-            warn "Пропускаю '$n': недопустимое имя для vpnctl."
-            continue
-        fi
-        if client_exists "$n"; then
-            jq --arg n "$n" --arg p "$pw" '.clients[$n].hy2_pass = $p' "$CLIENTS_FILE" | clients_write
-            updated=$((updated + 1))
-        else
-            client_create "$n" "$pw"
-            added=$((added + 1))
-        fi
-    done <<< "$users"
+    hdr "Xray: проверка конфига"
+    xray run -test -config /usr/local/etc/xray/config.json 2>&1 | tail -n 5 || true
 
-    state_load
-    render_all; reload_all
-    ok "Импортировано: новых ${added}, обновлено ${updated}."
+    hdr "Xray: локальное TLS-рукопожатие на свой же порт"
+    printf '  (должен ответить сертификат %s — значит REALITY маскируется верно)\n' "${REALITY_SNI:-?}"
+    timeout 15 openssl s_client -connect "127.0.0.1:${VLESS_PORT:-443}" \
+        -servername "${REALITY_SNI:-www.microsoft.com}" </dev/null 2>/dev/null \
+        | grep -E '^(subject|issuer|Verify return code)|Protocol|Cipher' | head -n 6 \
+        || echo "  рукопожатие НЕ прошло"
 
-    if [ -n "$port" ] && [ "$port" != "${HY2_PORT:-}" ]; then
-        warn "Порт отличается: старый UDP/${port}, сейчас UDP/${HY2_PORT}."
-        warn "Чтобы старые ссылки заработали полностью, переустановите с этим портом:"
-        warn "  cd /opt/vpnstack && ./install.sh --only base,hysteria --hy2-port ${port}"
-    else
-        ok "Порт совпадает — старые ссылки Hysteria должны заработать как раньше."
-    fi
-    warn "Сертификат тоже должен совпасть: старые ссылки с insecure=1 не подойдут к Let's Encrypt и наоборот."
-}
+    hdr "Xray: доступен ли маскировочный сайт с сервера"
+    timeout 15 openssl s_client -connect "${REALITY_SNI:-www.microsoft.com}:443" \
+        -servername "${REALITY_SNI:-www.microsoft.com}" -alpn h2 -tls1_3 </dev/null 2>/dev/null \
+        | grep -E 'ALPN|Protocol|Verify return code' | head -n 4 \
+        || echo "  маскировочный сайт НЕДОСТУПЕН с сервера — REALITY работать не будет"
 
-cmd_dns() {
-    local d="${1:-${HY2_DOMAIN:-}}"
-    [ -n "$d" ] || die "Укажите домен: vpnctl dns <домен>"
-    hdr "DNS: $d"
-    local ips; ips=$(resolve_a "$d")
-    if [ -z "$ips" ]; then
-        err "Домен не резолвится вообще. Проверьте, что A-запись создана."
-        return 1
-    fi
-    printf '  A-записи      : %s\n' "$(printf '%s' "$ips" | tr '\n' ' ')"
-    printf '  этот сервер   : %s\n' "${SERVER_IP4:-?}"
-    if printf '%s\n' "$ips" | grep -qx "${SERVER_IP4:-нет}"; then
-        ok "Совпадает — можно выдавать сертификат Let's Encrypt."
-        if [ "${HY2_TLS_MODE:-}" = "selfsigned" ]; then
-            warn "Сейчас стоит самоподписанный. Переключить: vpnctl tls-acme $d <email>"
-        fi
-    else
-        warn "Не совпадает: домен ведёт на другой сервер, либо DNS ещё не разошёлся."
-        warn "Пока домен не переедет, Let's Encrypt сертификат не выдаст."
-    fi
-    return 0
+    hdr "Hysteria: конфиг (пароли скрыты)"
+    sed -E 's/(password|: )[^ ]{8,}/\1***/' /etc/hysteria/config.yaml 2>/dev/null | head -n 30 \
+        || echo "  нет конфига"
+
+    hdr "nftables: входящая цепочка"
+    nft list chain inet filter input 2>/dev/null || echo "  правил нет"
+
+    hdr "Журналы"
+    for u in xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; do
+        printf '\n--- %s ---\n' "$u"
+        journalctl -u "$u" -n 20 --no-pager 2>/dev/null || true
+    done
+
+    hdr "DNS"
+    [ -n "${HY2_DOMAIN:-}" ] && cmd_dns "$HY2_DOMAIN" || echo "  домен не задан"
+
+    hdr "Готово"
+    echo "  Пришлите весь вывод выше — секреты в нём уже замаскированы."
 }
 
 case "${1:-}" in
@@ -271,6 +252,7 @@ case "${1:-}" in
     regen)   render_all; reload_all; ok "Конфиги перегенерированы." ;;
     restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
     tls-acme) shift; cmd_tls_acme "$@" ;;
+    diag)    cmd_diag ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
 esac
