@@ -9,6 +9,7 @@ VPNSTACK_DIR="${VPNSTACK_DIR:-/opt/vpnstack}"
 . "$VPNSTACK_DIR/lib/cert.sh"
 . "$VPNSTACK_DIR/lib/clients.sh"
 . "$VPNSTACK_DIR/lib/probe.sh"
+. "$VPNSTACK_DIR/lib/firewall.sh"
 
 require_root
 detect_os
@@ -36,6 +37,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl probe                перебрать маскировочные сайты и отпечатки TLS
   vpnctl set-fp <отпечаток>   сменить отпечаток TLS в ссылках
   vpnctl set-sni <домен>      сменить маскировочный домен (с проверкой) и выдать ссылки
+  vpnctl set-port <порт>      перенести VLESS на другой порт (если душат 443)
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -286,11 +288,29 @@ cmd_debug() {
             elif grep -q 'failed to read client hello' "$elog"; then
                 echo "  Найдено: REALITY ... failed to read client hello"
                 echo
-                echo "  Пакеты от клиента ДОХОДЯТ — сеть и firewall ни при чём."
-                echo "  Но TLS-приветствие не пришло. Если это единичные записи от вашего"
-                echo "  адреса — скорее всего приложение просто меряло задержку (открыло"
-                echo "  соединение и закрыло). Смотрите, есть ли РЯДОМ записи об успешном"
-                echo "  подключении; если их нет, проверьте импорт ссылки:"
+                echo "  TCP-соединение открывается, но TLS-приветствие не приходит."
+                echo
+                echo "  Два разных случая:"
+                echo "   * единичные записи, а VPN при этом работает — приложение просто"
+                echo "     меряет задержку: открыло соединение и закрыло, это нормально;"
+                echo "   * VPN не работает — приветствие теряется по дороге. Так выглядит"
+                echo "     активный DPI: TCP пропускает, пакет с ClientHello режет."
+                echo
+                echo "  Что проверить в этом случае (по убыванию пользы):"
+                echo "   1) другая сеть на устройстве: мобильный интернет вместо Wi-Fi."
+                echo "      Заработало — душит конкретный оператор."
+                echo "   2) другой маскировочный домен (его видит DPI в открытом виде):"
+                echo "        vpnctl set-sni dl.google.com"
+                echo "   3) другой порт — 443 под особым вниманием:"
+                echo "        vpnctl set-port 8443"
+                echo
+                echo "  Обе команды сразу печатают новые ссылки: после каждой смены"
+                echo "  профиль на устройстве надо удалить и завести заново."
+                echo
+                echo "  Если ничего не помогает — пользуйтесь Hysteria и AmneziaWG: они"
+                echo "  на UDP с обфускацией, у них другой профиль трафика."
+                echo
+                echo "  На всякий случай, поля профиля для сверки:"
                 echo "    1) импортировать по QR-коду, а не копированием текста:"
                 echo "         vpnctl show <имя> --qr"
                 echo "    2) проверить в приложении поля:"
@@ -528,6 +548,23 @@ cmd_set_sni() {
     cmd_links --qr
 }
 
+# Смена порта VLESS: конфиг, правила firewall и ссылки меняются вместе.
+# Нужна, когда провайдер душит именно 443/tcp.
+cmd_set_port() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] \
+        || die "Использование: vpnctl set-port <1-65535>"
+    local prev="${VLESS_PORT}"
+    state_set VLESS_PORT "$p"
+    state_load
+    setup_firewall || warn "Правила firewall обновить не удалось — проверьте вручную."
+    render_xray; systemctl restart xray
+    wait_service_ready xray tcp "$p" 15 && ok "VLESS: ${prev}/tcp -> ${p}/tcp" \
+        || warn "Xray не занял порт ${p} — смотрите journalctl -u xray"
+    warn "СТАРЫЕ ССЫЛКИ БОЛЬШЕ НЕ РАБОТАЮТ — переимпортируйте новые."
+    cmd_links --qr
+}
+
 # Отпечаток TLS влияет только на клиента и живёт в ссылке.
 cmd_set_fp() {
     local f="${1:-}"
@@ -669,6 +706,7 @@ case "${1:-}" in
     probe)   cmd_probe ;;
     set-fp)  shift; cmd_set_fp "${1:-}" ;;
     set-sni) shift; cmd_set_sni "${1:-}" ;;
+    set-port) shift; cmd_set_port "${1:-}" ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
