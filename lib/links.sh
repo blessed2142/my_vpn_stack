@@ -6,8 +6,8 @@ urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
 vless_link() { # vless_link NAME
     local name="$1" uuid
     uuid=$(client_get "$name" uuid); [ -n "$uuid" ] || return 1
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$uuid" "$ENDPOINT" "${VLESS_PORT:-443}" "$REALITY_SNI" \
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$uuid" "$ENDPOINT" "${VLESS_PORT:-443}" "$REALITY_SNI" "${REALITY_FP:-chrome}" \
         "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$(urlenc "${TAG_PREFIX:-VPN}-REALITY-$name")"
 }
 

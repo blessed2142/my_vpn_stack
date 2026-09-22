@@ -20,6 +20,7 @@ cat <<USAGE
   --email <email>         email для Let's Encrypt (по умолчанию admin@<домен>)
   --endpoint <хост|IP>    что писать клиентам как адрес сервера (по умолчанию: домен, иначе IPv4)
   --reality-sni <домен>   маскировочный сайт для REALITY (по умолчанию подбирается)
+  --reality-fp <отпечаток> отпечаток TLS в клиентских ссылках (chrome по умолчанию)
   --vless-port <порт>     TCP-порт VLESS REALITY (443)
   --hy2-port <порт>       UDP-порт Hysteria2 (443)
   --awg-port <порт>       UDP-порт AmneziaWG (51820)
@@ -42,7 +43,7 @@ USAGE
 }
 
 # ------------------------------------------------------------------ аргументы
-DOMAIN=""; EMAIL=""; ENDPOINT_ARG=""; SNI_ARG=""
+DOMAIN=""; EMAIL=""; ENDPOINT_ARG=""; SNI_ARG=""; FP_ARG=""
 VLESS_PORT_ARG=443; HY2_PORT_ARG=443; AWG_PORT_ARG=51820
 FIRST_CLIENT="main"; ONLY="base,xray,hysteria,awg"
 HY2_OBFS_ARG=1; IPV6_ARG=1; FW_ARG=1; BT_ARG=1
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do
         --email) EMAIL="$2"; shift 2 ;;
         --endpoint) ENDPOINT_ARG="$2"; shift 2 ;;
         --reality-sni) SNI_ARG="$2"; shift 2 ;;
+        --reality-fp) FP_ARG="$2"; shift 2 ;;
         --vless-port) VLESS_PORT_ARG="$2"; shift 2 ;;
         --hy2-port) HY2_PORT_ARG="$2"; shift 2 ;;
         --awg-port) AWG_PORT_ARG="$2"; shift 2 ;;
@@ -110,6 +112,7 @@ state_set WAN_IFACE "$(default_iface)"
 [ -n "$EMAIL" ] && state_set ACME_EMAIL "$EMAIL"
 [ -z "${ACME_EMAIL:-}" ] && [ -n "${HY2_DOMAIN:-}" ] && state_set ACME_EMAIL "admin@${HY2_DOMAIN}"
 [ -n "$SNI_ARG" ] && state_set REALITY_SNI "$SNI_ARG"
+state_set REALITY_FP "${FP_ARG:-${REALITY_FP:-chrome}}"
 
 state_set VLESS_PORT "$VLESS_PORT_ARG"
 state_set HY2_PORT   "$HY2_PORT_ARG"
