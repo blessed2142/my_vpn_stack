@@ -250,15 +250,44 @@ cmd_debug() {
             render_xray; systemctl restart xray
             ok "Подробные логи выключены." ;;
         log)
+            local elog=/var/log/xray/error.log
             hdr "Xray: подключения"
             tail -n 40 /var/log/xray/access.log 2>/dev/null || echo "  лога нет — включите: vpnctl debug on"
             hdr "Xray: ошибки"
-            tail -n 30 /var/log/xray/error.log 2>/dev/null || true
+            tail -n 30 "$elog" 2>/dev/null || true
             hdr "Hysteria: последние события"
-            journalctl -u hysteria-server -n 30 --no-pager 2>/dev/null | grep -vE 'server up and running|server mode' || true
-            echo
-            echo "  Пусто в обоих -> попытки подключения до сервера не доходят."
-            echo "  Есть записи с ошибками -> дело в параметрах клиента." ;;
+            journalctl -u hysteria-server -n 20 --no-pager 2>/dev/null \
+                | grep -vE 'server up and running|server mode' || true
+
+            hdr "Что это значит"
+            if [ ! -s "$elog" ]; then
+                echo "  Логов нет. Включите отладку (vpnctl debug on) и повторите попытку."
+            elif grep -q 'failed to read client hello' "$elog"; then
+                echo "  Найдено: REALITY ... failed to read client hello"
+                echo
+                echo "  Пакеты от клиента ДОХОДЯТ — сеть и firewall ни при чём."
+                echo "  Но клиент не прислал TLS-приветствие: приложение не включило REALITY."
+                echo "  Почти всегда это неполный импорт ссылки. Что делать:"
+                echo "    1) импортировать по QR-коду, а не копированием текста:"
+                echo "         vpnctl show <имя> --qr"
+                echo "    2) проверить в приложении поля:"
+                echo "         security/тип   = reality"
+                echo "         publicKey/pbk  = ${REALITY_PUBLIC_KEY:-?}"
+                echo "         shortId/sid    = ${REALITY_SHORT_ID:-?}"
+                echo "         sni/serverName = ${REALITY_SNI:-?}"
+                echo "         fingerprint    = chrome"
+                echo "         flow           = xtls-rprx-vision"
+                echo "    3) если полей REALITY в приложении нет — оно устарело, нужно другое"
+                echo "       (v2rayNG, NekoBox, Hiddify, Streisand)."
+            elif grep -qiE 'invalid user|not match|authentication failed' "$elog"; then
+                echo "  Клиент дошёл до проверки, но не опознан: UUID в приложении не тот."
+                echo "  Возьмите ссылку заново: vpnctl show <имя> --qr"
+            elif grep -qiE 'accepted|connection' /var/log/xray/access.log 2>/dev/null; then
+                echo "  Подключения проходят — на стороне VLESS всё в порядке."
+            else
+                echo "  Записей о попытках нет: пакеты до сервера не долетают."
+                echo "  Проверьте внешний firewall хостера и vpnctl check-ports."
+            fi ;;
         *) die "Использование: vpnctl debug on|off|log" ;;
     esac
 }

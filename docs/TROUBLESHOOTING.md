@@ -97,6 +97,25 @@ journalctl -u awg-quick@awg0 -n 50 --no-pager
 
 ## VLESS REALITY не подключается
 
+Сначала выясните, доходят ли пакеты вообще:
+
+```bash
+vpnctl debug on      # включить подробные логи
+#   -> попробовать подключиться с устройства
+vpnctl debug log     # покажет логи и разберёт типовые ошибки
+vpnctl debug off
+```
+
+* `REALITY: failed to read client hello` — пакеты доходят, но приложение не
+  включило REALITY. Почти всегда неполный импорт ссылки: импортируйте по
+  QR-коду (`vpnctl show <имя> --qr`) и проверьте в профиле `publicKey`,
+  `shortId`, `sni`, `flow`.
+* Записей нет вовсе — трафик до сервера не доходит, смотрите внешний firewall
+  хостера (`vpnctl check-ports`).
+
+### Прочие причины
+
+
 * Проверьте, что клиент использует `flow = xtls-rprx-vision` и `fp = chrome`.
 * `sni` в клиенте должен в точности совпадать с `REALITY_SNI` из `vpnctl info`.
 * Маскировочный сайт мог перестать отдавать TLS 1.3 + h2. Сменить:
