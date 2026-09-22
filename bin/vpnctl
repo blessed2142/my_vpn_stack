@@ -29,6 +29,8 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl diag                 полная диагностика для разбора проблем
+  vpnctl check-ports          доступны ли порты снаружи (кто виноват: хостер или клиент)
+  vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
   vpnctl import-hysteria [файл]   забрать пользователей и пароль обфускации
@@ -205,6 +207,62 @@ cmd_dns() {
     return 0
 }
 
+# Доходят ли пакеты снаружи. Главный вопрос, когда сервер здоров, а клиенты
+# не подключаются: ответ либо «блокирует хостер», либо «дело в клиенте».
+cmd_check_ports() {
+    hdr "Доступность портов снаружи"
+    local p reach
+    for p in "${VLESS_PORT:-443}" 80; do
+        reach=$(timeout 25 curl -fsS --max-time 20 "https://ifconfig.co/port/${p}" 2>/dev/null \
+                | jq -r '.reachable // empty' 2>/dev/null)
+        case "$reach" in
+            true)  printf '  tcp/%-6s %sдоступен снаружи%s\n' "$p" "$C_GRN" "$C_OFF" ;;
+            false) printf '  tcp/%-6s %sЗАКРЫТ снаружи%s — блокирует хостер или внешний firewall\n' "$p" "$C_RED" "$C_OFF" ;;
+            *)     printf '  tcp/%-6s проверить не вышло (сервис ifconfig.co недоступен)\n' "$p" ;;
+        esac
+    done
+    cat <<'NOTE'
+
+  UDP так не проверить — нет публичного сервиса. Проверьте с клиента:
+    Linux/macOS : nc -vzu <адрес сервера> 443
+    либо просто попробуйте подключиться и посмотрите vpnctl debug log
+
+  Если tcp/443 закрыт снаружи, а Xray слушает — дело не в сервере:
+  ищите firewall в панели хостера.
+NOTE
+}
+
+# Временно включает подробные логи Xray, чтобы увидеть, доходят ли попытки
+# подключения вообще. Если в логе пусто — пакеты до сервера не долетают.
+cmd_debug() {
+    case "${1:-}" in
+        on)
+            mkdir -p /var/log/xray
+            chown nobody:nogroup /var/log/xray 2>/dev/null || chown nobody:nobody /var/log/xray 2>/dev/null || true
+            state_set XRAY_DEBUG 1
+            render_xray; systemctl restart xray
+            ok "Подробные логи Xray включены."
+            echo "  1) попробуйте подключиться с телефона"
+            echo "  2) затем: vpnctl debug log"
+            echo "  3) потом обязательно: vpnctl debug off" ;;
+        off)
+            state_set XRAY_DEBUG 0
+            render_xray; systemctl restart xray
+            ok "Подробные логи выключены." ;;
+        log)
+            hdr "Xray: подключения"
+            tail -n 40 /var/log/xray/access.log 2>/dev/null || echo "  лога нет — включите: vpnctl debug on"
+            hdr "Xray: ошибки"
+            tail -n 30 /var/log/xray/error.log 2>/dev/null || true
+            hdr "Hysteria: последние события"
+            journalctl -u hysteria-server -n 30 --no-pager 2>/dev/null | grep -vE 'server up and running|server mode' || true
+            echo
+            echo "  Пусто в обоих -> попытки подключения до сервера не доходят."
+            echo "  Есть записи с ошибками -> дело в параметрах клиента." ;;
+        *) die "Использование: vpnctl debug on|off|log" ;;
+    esac
+}
+
 cmd_firewall() {
     case "${1:-}" in
         off)
@@ -328,6 +386,8 @@ case "${1:-}" in
     tls-acme) shift; cmd_tls_acme "$@" ;;
     diag)    cmd_diag ;;
     firewall) shift; cmd_firewall "${1:-}" ;;
+    check-ports) cmd_check_ports ;;
+    debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
 esac

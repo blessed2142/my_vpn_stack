@@ -60,6 +60,16 @@ if [ "${HY2_TLS_MODE:-}" = "acme" ]; then
     HY2_TLS_MODE=""
 fi
 
+# Самоподписанный — это запасной вариант, а не окончательный выбор. Если домен
+# теперь указывает сюда, надо повторить попытку получить настоящий сертификат,
+# иначе неудача первой установки закрепляется навсегда.
+if [ "${HY2_TLS_MODE:-}" = "selfsigned" ] && [ -n "${HY2_DOMAIN:-}" ] \
+   && domain_points_here "$HY2_DOMAIN" "$SERVER_IP4"; then
+    log "Домен ${HY2_DOMAIN} указывает сюда — пробую заменить самоподписанный сертификат на Let's Encrypt."
+    state_set HY2_TLS_MODE ""
+    HY2_TLS_MODE=""
+fi
+
 if [ -z "${HY2_TLS_MODE:-}" ]; then
     if [ -n "${HY2_CERT:-}" ] && [ -n "${HY2_KEY:-}" ]; then
         [ -s "$HY2_CERT" ] && [ -s "$HY2_KEY" ] || die "Указанные --hy2-cert/--hy2-key не найдены."

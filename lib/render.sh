@@ -16,6 +16,11 @@ render_xray() {
         | {id: .value.uuid, flow: "xtls-rprx-vision", email: .key}]' "$CLIENTS_FILE")
 
     mkdir -p "$(dirname "$XRAY_CONF")"
+    if [ "${XRAY_DEBUG:-0}" = "1" ]; then
+        # без существующего каталога Xray не стартует вовсе
+        mkdir -p /var/log/xray
+        chown nobody:nogroup /var/log/xray 2>/dev/null || chown nobody:nobody /var/log/xray 2>/dev/null || true
+    fi
     jq -n \
       --argjson clients "$clients" \
       --argjson port "${VLESS_PORT:-443}" \
@@ -24,8 +29,13 @@ render_xray() {
       --arg pk "${REALITY_PRIVATE_KEY}" \
       --arg sid "${REALITY_SHORT_ID}" \
       --argjson bt "${BLOCK_TORRENT:-1}" \
+      --argjson dbg "${XRAY_DEBUG:-0}" \
       '{
-        log: { loglevel: "warning" },
+        log: (if $dbg == 1
+              then { loglevel: "debug",
+                     access: "/var/log/xray/access.log",
+                     error: "/var/log/xray/error.log" }
+              else { loglevel: "warning" } end),
         inbounds: [{
           tag: "vless-reality",
           listen: "::",
