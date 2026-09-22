@@ -30,6 +30,7 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl diag                 полная диагностика для разбора проблем
   vpnctl check-ports          доступны ли порты снаружи (кто виноват: хостер или клиент)
+  vpnctl selftest             подключиться к своему же VLESS настоящим клиентом
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status   аварийно включить/выключить nftables
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -292,6 +293,76 @@ cmd_debug() {
     esac
 }
 
+# Поднимает на сервере настоящий клиент Xray и ходит через него наружу.
+# Разводит три случая: сломан протокол/конфиг, сломан сетевой путь, или всё
+# исправно и дело в приложении на устройстве.
+_selftest_vless() { # _selftest_vless АДРЕС ПОДПИСЬ
+    local addr="$1" label="$2" tmp pid code port=10809
+    local name uuid
+    name=$(clients_names | head -n1)
+    uuid=$(client_get "$name" uuid)
+    [ -n "$uuid" ] || { err "  ${label}: у клиента '$name' нет UUID"; return 1; }
+
+    tmp=$(mktemp -d)
+    jq -n --arg addr "$addr" --argjson vport "${VLESS_PORT:-443}" --argjson sport "$port" \
+          --arg uuid "$uuid" --arg sni "${REALITY_SNI}" \
+          --arg pbk "${REALITY_PUBLIC_KEY}" --arg sid "${REALITY_SHORT_ID}" '{
+        log: { loglevel: "warning" },
+        inbounds: [{ listen: "127.0.0.1", port: $sport, protocol: "socks",
+                     settings: { udp: false } }],
+        outbounds: [{
+          protocol: "vless",
+          settings: { vnext: [{ address: $addr, port: $vport,
+                       users: [{ id: $uuid, encryption: "none", flow: "xtls-rprx-vision" }] }] },
+          streamSettings: { network: "tcp", security: "reality",
+            realitySettings: { serverName: $sni, fingerprint: "chrome",
+                               publicKey: $pbk, shortId: $sid } }
+        }]
+      }' > "$tmp/client.json"
+
+    xray run -c "$tmp/client.json" >"$tmp/log" 2>&1 &
+    pid=$!
+    sleep 2
+    code=$(timeout 25 curl -s -o /dev/null -w '%{http_code}' \
+           --proxy "socks5h://127.0.0.1:${port}" --max-time 20 \
+           https://cp.cloudflare.com/generate_204 2>/dev/null || echo 000)
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+        printf '  %s%s: трафик прошёл%s\n' "$C_GRN" "$label" "$C_OFF"
+        rm -rf "$tmp"; return 0
+    fi
+    printf '  %s%s: не прошёл (код %s)%s\n' "$C_RED" "$label" "$code" "$C_OFF"
+    sed 's/^/      /' "$tmp/log" 2>/dev/null | tail -n 5
+    rm -rf "$tmp"; return 1
+}
+
+cmd_selftest() {
+    have xray || die "Xray не установлен."
+    [ -n "${REALITY_PUBLIC_KEY:-}" ] || die "VLESS не настроен."
+    hdr "Самопроверка VLESS REALITY"
+    echo "  Поднимаю клиент Xray прямо на сервере и пробую выйти в интернет."
+    echo
+
+    local lo=0 ext=0
+    _selftest_vless "127.0.0.1" "через loopback (только протокол)" && lo=1
+    _selftest_vless "${ENDPOINT}" "через ${ENDPOINT} (протокол + сеть)" && ext=1
+
+    hdr "Вывод"
+    if [ "$lo" = 1 ] && [ "$ext" = 1 ]; then
+        echo "  Сервер и сетевой путь исправны: настоящий клиент подключается."
+        echo "  Значит дело в приложении на устройстве или в его сети."
+        echo "  Проверьте: другое приложение, другая сеть (мобильный интернет вместо Wi-Fi)."
+    elif [ "$lo" = 1 ] && [ "$ext" = 0 ]; then
+        echo "  Протокол работает, но через внешний адрес — нет."
+        echo "  Трафик рвут по дороге: внешний firewall хостера или фильтрация по пути."
+    else
+        echo "  Не работает даже через loopback — проблема на сервере."
+        echo "  Пришлите вывод целиком, разберём."
+    fi
+}
+
 cmd_firewall() {
     case "${1:-}" in
         off)
@@ -416,6 +487,7 @@ case "${1:-}" in
     diag)    cmd_diag ;;
     firewall) shift; cmd_firewall "${1:-}" ;;
     check-ports) cmd_check_ports ;;
+    selftest) cmd_selftest ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;
