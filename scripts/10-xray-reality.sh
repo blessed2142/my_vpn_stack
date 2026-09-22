@@ -29,6 +29,14 @@ pick_reality_sni() {
     return 1
 }
 
+# Маскировочный домен мог приехать испорченным (например, скопированным из
+# чата вместе с разметкой) — тогда REALITY молча не работает. Проверяем форму.
+if [ -n "${REALITY_SNI:-}" ] && ! [[ "$REALITY_SNI" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    warn "REALITY_SNI задан некорректно: '${REALITY_SNI}' — это не доменное имя. Подберу заново."
+    state_set REALITY_SNI ""
+    REALITY_SNI=""
+fi
+
 if [ -z "${REALITY_SNI:-}" ]; then
     SNI=$(pick_reality_sni "${REALITY_SNI_PREFERRED:-}" www.microsoft.com www.nvidia.com www.samsung.com dl.google.com www.cloudflare.com) \
         || die "Ни один маскировочный сайт не прошёл проверку. Задайте свой: --reality-sni <домен>"
