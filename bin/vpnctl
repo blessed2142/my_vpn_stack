@@ -21,6 +21,7 @@ cat <<USAGE
 vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + AmneziaWG)
 
   vpnctl add <имя> [--qr]     создать клиента во всех трёх протоколах
+  vpnctl add <имя> --awg      только AmneziaWG (или --only vless,hy2,awg)
   vpnctl del <имя>            удалить клиента
   vpnctl list                 список клиентов
   vpnctl show <имя> [--qr]    ссылки/конфиги клиента
@@ -50,16 +51,36 @@ USAGE
 }
 
 cmd_add() {
-    local name="${1:-}"; shift || true
-    [ -n "$name" ] || die "Укажите имя: vpnctl add <имя>"
+    local name="" qr="" only=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --qr) qr="--qr"; shift ;;
+            --only) only="$2"; shift 2 ;;
+            --only=*) only="${1#--only=}"; shift ;;
+            --awg) only="awg"; shift ;;
+            --hy2|--hysteria) only="hy2"; shift ;;
+            --vless) only="vless"; shift ;;
+            -*) die "Неизвестный ключ: $1" ;;
+            *) [ -n "$name" ] && die "Лишний аргумент: $1"; name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "Укажите имя: vpnctl add <имя> [--only vless,hy2,awg] [--qr]"
     valid_name "$name" || die "Имя: латиница/цифры/._- до 32 символов."
     client_exists "$name" && die "Клиент '$name' уже существует."
 
+    if [ -n "$only" ]; then
+        local t
+        for t in ${only//,/ }; do
+            case "$t" in vless|hy2|awg) ;; *) die "Протоколы: vless, hy2, awg (через запятую)." ;; esac
+        done
+        PROVISION_ONLY="$only"
+    fi
+
     provision_client "$name"
     render_all; reload_all
-    ok "Клиент '$name' создан."
+    ok "Клиент '$name' создан${only:+ (только: ${only})}."
     state_load
-    show_client "$name" "${1:-}"
+    show_client "$name" "$qr"
 }
 
 cmd_del() {

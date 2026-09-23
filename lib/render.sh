@@ -82,11 +82,16 @@ render_hysteria() {
         return 0
     fi
     # Пустой auth.userpass -> "invalid config: empty auth userpass", и сервис
-    # не поднимется вовсе. Ловим это до записи конфига, а не по факту падения.
+    # не поднимется вовсе. Это законная ситуация: клиентов могли завести только
+    # под AmneziaWG. Тогда не пишем битый конфиг, а останавливаем сервис.
     local nusers
     nusers=$(jq '[.clients[]? | select(.hy2_pass != null)] | length' "$CLIENTS_FILE" 2>/dev/null || echo 0)
-    [ "${nusers:-0}" -gt 0 ] \
-        || die "У Hysteria нет ни одного пользователя — она не запустится. Заведите клиента: vpnctl add <имя>"
+    if [ "${nusers:-0}" -eq 0 ]; then
+        warn "У Hysteria не осталось ни одного пользователя — останавливаю сервис."
+        warn "Заработает снова, как только появится клиент: vpnctl add <имя>"
+        systemctl stop hysteria-server 2>/dev/null || true
+        return 0
+    fi
 
     case "${HY2_TLS_MODE:-selfsigned}" in
         custom) [ -n "${HY2_CERT:-}" ] && [ -n "${HY2_KEY:-}" ] \
@@ -192,7 +197,14 @@ render_all() { render_xray; render_hysteria; render_awg; }
 
 # ------------------------------------------------------------------ reload
 reload_xray() { svc_active xray && systemctl restart xray || true; }
-reload_hysteria() { svc_active hysteria-server && systemctl restart hysteria-server || true; }
+reload_hysteria() {
+    # Сервис мог быть остановлен из-за отсутствия пользователей — если они
+    # появились, его надо не перезапустить, а поднять.
+    if [ -s "$HY2_CONF" ] && jq -e '[.clients[]? | select(.hy2_pass != null)] | length > 0' \
+         "$CLIENTS_FILE" >/dev/null 2>&1; then
+        systemctl restart hysteria-server 2>/dev/null || true
+    fi
+}
 reload_awg() {
     if ip link show "$AWG_IFACE" >/dev/null 2>&1; then
         awg syncconf "$AWG_IFACE" <(awg-quick strip "$AWG_IFACE") 2>/dev/null \

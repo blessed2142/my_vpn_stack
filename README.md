@@ -80,6 +80,7 @@ vpnctl import-hysteria /etc/hysteria/config.yaml.manual-20260101120000
 
 ```
 vpnctl add <имя> [--qr]     создать клиента сразу во всех трёх протоколах
+vpnctl add <имя> --awg      только AmneziaWG (и --only vless,hy2,awg)
 vpnctl del <имя>            удалить клиента отовсюду
 vpnctl list                 список клиентов
 vpnctl show <имя> [--qr]    ссылки и конфиги клиента

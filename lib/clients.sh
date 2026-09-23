@@ -19,19 +19,27 @@ _client_patch() { # _client_patch ИМЯ <jq-выражение> [--arg ...]
 # каждом этапе установки: когда работает этап Hysteria, ключей AmneziaWG ещё
 # нет, и наоборот. Пустой auth.userpass для Hysteria — фатальная ошибка при
 # старте, поэтому клиент обязан появиться до генерации конфига, а не после.
+# Какие протоколы выдавать клиенту. Пусто — все, что настроены на сервере.
+# Ограничение нужно, например, когда Hysteria используется одним общим
+# аккаунтом, а отдельные записи заводятся только ради AmneziaWG.
+_want() { # _want vless|hy2|awg
+    [ -z "${PROVISION_ONLY:-}" ] && return 0
+    case ",${PROVISION_ONLY}," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+
 provision_client() { # provision_client ИМЯ [ПАРОЛЬ_HY2]
     local name="$1" forced="${2:-}"
     valid_name "$name" || die "Недопустимое имя клиента: '$name'"
     clients_init
     client_exists "$name" || _client_patch "$name" '.clients[$n] = {created: $ts}' --arg ts "$(date -Is)"
 
-    if [ -n "${REALITY_PRIVATE_KEY:-}" ] && [ -z "$(client_get "$name" uuid)" ]; then
+    if _want vless && [ -n "${REALITY_PRIVATE_KEY:-}" ] && [ -z "$(client_get "$name" uuid)" ]; then
         local uuid
         uuid=$(have xray && xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
         _client_patch "$name" '.clients[$n].uuid = $v' --arg v "$uuid"
     fi
 
-    if [ "${HY2_MANAGED:-1}" = "1" ] && [ -n "${HY2_PORT:-}" ]; then
+    if _want hy2 && [ "${HY2_MANAGED:-1}" = "1" ] && [ -n "${HY2_PORT:-}" ]; then
         if [ -n "$forced" ]; then
             _client_patch "$name" '.clients[$n].hy2_pass = $v' --arg v "$forced"
         elif [ -z "$(client_get "$name" hy2_pass)" ]; then
@@ -39,7 +47,7 @@ provision_client() { # provision_client ИМЯ [ПАРОЛЬ_HY2]
         fi
     fi
 
-    if [ -n "${AWG_PUBLIC_KEY:-}" ] && [ -z "$(client_get "$name" awg_pub)" ]; then
+    if _want awg && [ -n "${AWG_PUBLIC_KEY:-}" ] && [ -z "$(client_get "$name" awg_pub)" ]; then
         local priv pub psk idx
         priv=$(awg genkey); pub=$(printf '%s' "$priv" | awg pubkey); psk=$(awg genpsk)
         idx=$(next_awg_index)
