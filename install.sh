@@ -141,14 +141,23 @@ state_set CLIENT_DNS6 "${CLIENT_DNS6:-2606:4700:4700::1111}"
 state_set TAG_PREFIX "${TAG_PREFIX:-$(hostname -s 2>/dev/null || echo vpn)}"
 state_set FIRST_CLIENT "$FIRST_CLIENT"
 
+# Общий адрес уже зашит в розданные конфиги — при повторном запуске его не
+# меняем (разве что IP сервера сменился). Домен, заработавший позже, получает
+# только Hysteria: ей он нужен под сертификат.
 if [ -n "$ENDPOINT_ARG" ]; then
     state_set ENDPOINT "$ENDPOINT_ARG"
+elif [ -n "${ENDPOINT:-}" ] && { [[ ! "$ENDPOINT" =~ ^[0-9.]+$ ]] || [ "$ENDPOINT" = "$SERVER_IP4" ]; }; then
+    log "Оставляю прежний адрес подключения: ${ENDPOINT}"
 elif [ -n "${HY2_DOMAIN:-}" ] && domain_points_here "${HY2_DOMAIN}" "$SERVER_IP4"; then
     state_set ENDPOINT "${HY2_DOMAIN}"
 else
     state_set ENDPOINT "$SERVER_IP4"
 fi
-log "Клиенты будут подключаться на: ${ENDPOINT}"
+if [ -n "${HY2_DOMAIN:-}" ] && [ "$ENDPOINT" != "$HY2_DOMAIN" ] && [ -z "${HY2_ENDPOINT:-}" ] \
+   && domain_points_here "${HY2_DOMAIN}" "$SERVER_IP4"; then
+    state_set HY2_ENDPOINT "${HY2_DOMAIN}"
+fi
+log "Клиенты будут подключаться на: ${ENDPOINT}${HY2_ENDPOINT:+ (Hysteria2: ${HY2_ENDPOINT})}"
 
 [ "$VLESS_PORT" = "$HY2_PORT" ] && log "VLESS на TCP/${VLESS_PORT}, Hysteria2 на UDP/${HY2_PORT} — конфликта нет (разные протоколы)."
 

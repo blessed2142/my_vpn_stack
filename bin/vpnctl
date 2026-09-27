@@ -30,6 +30,8 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl regen                перегенерировать конфиги из состояния и перезапустить
   vpnctl restart              перезапустить все сервисы
   vpnctl tls-acme <домен> <email>   переключить Hysteria2 на Let's Encrypt
+  vpnctl set-hy2-endpoint <домен|IP|off>  адрес сервера в ссылках Hysteria2 (AmneziaWG не трогает)
+  vpnctl hy2-links [--qr]     только ссылки Hysteria2 всех клиентов
   vpnctl info                 параметры сервера (порты, SNI, ключи)
   vpnctl diag                 полная диагностика для разбора проблем
   vpnctl inspect [файл]       снимок всей конфигурации сервера в один файл
@@ -135,6 +137,7 @@ cmd_info() {
     short id        : ${REALITY_SHORT_ID:-?}
 
   Hysteria2         : UDP ${HY2_PORT:-?}   TLS: ${HY2_TLS_MODE:-не под управлением vpnctl}   SNI: ${HY2_SNI:-?}
+    адрес в ссылках : ${HY2_ENDPOINT:-${ENDPOINT:-?} (общий)}
     управление      : $( [ "${HY2_MANAGED:-1}" = "1" ] && echo "vpnctl" || echo "ваше ручное (--keep-hysteria)" )
     obfs salamander : ${HY2_OBFS_PASS:+включена}${HY2_OBFS_PASS:-выключена}
 
@@ -164,11 +167,48 @@ cmd_tls_acme() {
     wait_service_ready hysteria-server udp "${HY2_PORT}" 25 \
         || die "Не запустилась. Диагностика: vpnctl diag"
     ok "Hysteria2 переведена на сертификат Let's Encrypt ($d)."
-    if [ "${ENDPOINT:-}" = "${SERVER_IP4}" ]; then
-        state_set ENDPOINT "$d"
-        ok "Адрес подключения в ссылках переключён с ${SERVER_IP4} на ${d}."
+    # Меняем адрес только у Hysteria: общий ENDPOINT уже сидит в розданных
+    # конфигах AmneziaWG и VLESS.
+    state_set HY2_ENDPOINT "$d"
+    ok "Адрес подключения в ссылках Hysteria2: ${d}."
+    warn "Ссылки Hysteria2 изменились — раздайте заново: vpnctl hy2-links"
+}
+
+# Все ссылки Hysteria2 без остальных протоколов — чтобы после смены адреса
+# не перепечатывать заодно конфиги AmneziaWG.
+cmd_hy2_links() {
+    local n l outdir cnt=0
+    for n in $(clients_names); do
+        l=$(hy2_link "$n") || continue
+        outdir="$STATE_DIR/clients/$n"
+        mkdir -p "$outdir"; chmod 700 "$STATE_DIR/clients" "$outdir"
+        printf '\n%s%s%s\n' "$C_BLD" "$n" "$C_OFF"
+        echo "$l" | tee "$outdir/hysteria2.txt"
+        [ "${1:-}" = "--qr" ] && qr "$l"
+        cnt=$((cnt + 1))
+    done
+    [ "$cnt" -gt 0 ] || warn "Ни у одного клиента нет учётки Hysteria2."
+}
+
+cmd_set_hy2_endpoint() { # cmd_set_hy2_endpoint ДОМЕН|IP|off
+    local d="${1:-}"
+    [ -n "$d" ] || die "Использование: vpnctl set-hy2-endpoint <домен|IP|off>"
+    [ "${HY2_MANAGED:-1}" = "1" ] || die "Hysteria в режиме --keep-hysteria — её ссылки vpnctl не выдаёт."
+    if [ "$d" = "off" ]; then
+        state_set HY2_ENDPOINT ""
+        ok "Hysteria2 снова использует общий адрес: ${ENDPOINT}."
+    else
+        if [[ ! "$d" =~ ^[0-9.]+$ ]]; then
+            domain_points_here "$d" "${SERVER_IP4}" \
+                || die "A-записи $d ($(resolve_a "$d" | tr '\n' ' ')) не ведут на ${SERVER_IP4} — подождите обновления DNS."
+        fi
+        state_set HY2_ENDPOINT "$d"
+        ok "Адрес подключения в ссылках Hysteria2: ${d}."
     fi
-    warn "Ссылки изменились — раздайте заново: vpnctl links"
+    log "Серверные конфиги не менялись, сервисы не перезапускались; AmneziaWG и VLESS не затронуты."
+    [ "${HY2_INSECURE:-0}" = "1" ] && warn "Сертификат самоподписанный (insecure=1). Настоящий: vpnctl tls-acme ${HY2_DOMAIN:-<домен>} <email>"
+    cmd_hy2_links
+    warn "Раздайте клиентам новые ссылки Hysteria2 (старые с IP тоже продолжат работать)."
 }
 
 # Аварийный выключатель: если правила отрезали сервер, чинить надо быстро.
@@ -823,6 +863,8 @@ case "${1:-}" in
     regen)   render_all; reload_all; ok "Конфиги перегенерированы." ;;
     restart) systemctl restart xray hysteria-server "awg-quick@${AWG_IFACE:-awg0}"; ok "Перезапущено." ;;
     tls-acme) shift; cmd_tls_acme "$@" ;;
+    set-hy2-endpoint) shift; cmd_set_hy2_endpoint "${1:-}" ;;
+    hy2-links) shift || true; cmd_hy2_links "${1:-}" ;;
     diag)    cmd_diag ;;
     firewall) shift; cmd_firewall "${1:-}" ;;
     check-ports) cmd_check_ports ;;
