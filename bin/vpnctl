@@ -42,6 +42,10 @@ vpnctl — управление VPN-стеком (VLESS REALITY + Hysteria2 + Am
   vpnctl set-port <порт>      перенести VLESS на другой порт (если душат 443)
   vpnctl capture [порт] [сек] посмотреть, доходят ли TLS-приветствия до сервера
   vpnctl set-mss <байт|off>   ограничить MSS, если по пути теряются крупные пакеты
+  vpnctl set-mtu <1000-1500>  MTU туннеля AmneziaWG
+  vpnctl awg-kernel           перевести AmneziaWG на модуль ядра (быстрее userspace)
+  vpnctl awg-userspace        вернуть userspace-реализацию
+  vpnctl bench                скорость канала сервера и режим работы AmneziaWG
   vpnctl debug on|off|log     подробные логи Xray: доходят ли попытки подключения
   vpnctl firewall on|off|status|sync  правила nftables (sync — под текущие порты)
   vpnctl dns [домен]          куда сейчас указывает домен и совпадает ли с сервером
@@ -583,6 +587,142 @@ cmd_set_sni() {
     cmd_links --qr
 }
 
+# AmneziaWG в userspace (amneziawg-go) заметно медленнее и заметно прожорливее
+# по процессору, чем модуль ядра: каждый пакет ходит через /dev/net/tun и
+# переключение контекста. На Debian модуль ставится из PPA Amnezia — сборка
+# вручную для ядер 5.6+ требует полного дерева исходников ядра, а не заголовков.
+cmd_awg_kernel() {
+    require_root
+    if lsmod 2>/dev/null | grep -q '^amneziawg' || modprobe amneziawg 2>/dev/null; then
+        ok "Модуль ядра amneziawg уже доступен."
+    else
+        [ "$PKG" = "apt" ] || die "Автоустановка модуля поддерживается только для Debian/Ubuntu. Вручную: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
+
+        log "Ставлю зависимости (dkms, заголовки ядра $(uname -r))..."
+        pkg_install dkms build-essential gnupg ca-certificates "linux-headers-$(uname -r)" \
+            || die "Не удалось поставить заголовки ядра. Возможно, для вашего ядра их нет в репозитории."
+        [ -d "/lib/modules/$(uname -r)/build" ] \
+            || die "Нет /lib/modules/$(uname -r)/build — заголовки к текущему ядру отсутствуют. Обновите ядро и перезагрузитесь."
+
+        if [ "$OS_ID" = "ubuntu" ]; then
+            log "Подключаю ppa:amnezia/ppa..."
+            pkg_install software-properties-common
+            add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 || warn "PPA подключить не вышло."
+        else
+            log "Подключаю репозиторий Amnezia (сборка для focal, пакет собирается dkms под ваше ядро)..."
+            local key=/usr/share/keyrings/amnezia-ppa.gpg
+            if [ ! -s "$key" ]; then
+                curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828' \
+                    | gpg --dearmor -o "$key" 2>/dev/null \
+                    || die "Не удалось получить ключ репозитория."
+            fi
+            echo "deb [signed-by=${key}] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" \
+                > /etc/apt/sources.list.d/amnezia.list
+        fi
+        pkg_update
+        log "Собираю модуль (это занимает пару минут)..."
+        pkg_install amneziawg || pkg_install amneziawg-dkms \
+            || die "Пакет модуля не установился. Смотрите /var/lib/dkms/amneziawg/*/build/make.log"
+
+        modprobe amneziawg 2>/dev/null \
+            || die "Модуль собран, но не загружается. Логи сборки: /var/lib/dkms/amneziawg/*/build/make.log"
+        ok "Модуль ядра собран и загружен."
+    fi
+
+    echo amneziawg > /etc/modules-load.d/amneziawg.conf
+    # снимаем принудительный userspace, иначе awg-quick так и будет его звать
+    rm -f /etc/systemd/system/awg-quick@.service.d/10-userspace.conf
+    systemctl daemon-reload 2>/dev/null || true
+    state_set AWG_USE_KERNEL 1
+
+    log "Перезапускаю интерфейс ${AWG_IFACE:-awg0}..."
+    systemctl restart "awg-quick@${AWG_IFACE:-awg0}"
+    sleep 2
+    if awg show "${AWG_IFACE:-awg0}" >/dev/null 2>&1; then
+        if journalctl -u "awg-quick@${AWG_IFACE:-awg0}" -n 20 --no-pager 2>/dev/null | grep -q 'userspace'; then
+            warn "Интерфейс поднялся, но всё ещё в userspace — смотрите журнал."
+        else
+            ok "AmneziaWG работает на модуле ядра. Клиентам ничего менять не нужно."
+        fi
+    else
+        err "Интерфейс не поднялся. Откат в userspace: vpnctl awg-userspace"
+        journalctl -u "awg-quick@${AWG_IFACE:-awg0}" -n 20 --no-pager >&2 || true
+        return 1
+    fi
+}
+
+# Возврат к userspace, если с модулем что-то не так.
+cmd_awg_userspace() {
+    require_root
+    have amneziawg-go || die "amneziawg-go не установлен — откатываться некуда."
+    mkdir -p /etc/systemd/system/awg-quick@.service.d
+    cat > /etc/systemd/system/awg-quick@.service.d/10-userspace.conf <<'UNIT'
+[Service]
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+Environment=AWG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+UNIT
+    rm -f /etc/modules-load.d/amneziawg.conf
+    systemctl daemon-reload
+    state_set AWG_USE_KERNEL 0
+    systemctl restart "awg-quick@${AWG_IFACE:-awg0}"
+    sleep 2
+    awg show "${AWG_IFACE:-awg0}" >/dev/null 2>&1 \
+        && ok "Вернулся на userspace-реализацию." || die "Интерфейс не поднялся."
+}
+
+# MTU туннеля. Слишком большой -> пакеты фрагментируются или теряются, и всё
+# "тормозит"; слишком маленький -> лишние накладные расходы.
+cmd_set_mtu() {
+    local m="${1:-}"
+    [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge 1000 ] && [ "$m" -le 1500 ] \
+        || die "Использование: vpnctl set-mtu <1000-1500>  (типовые: 1420, 1380, 1280)"
+    local prev="${AWG_MTU:-1420}"
+    state_set AWG_MTU "$m"
+    state_load; render_awg
+    systemctl restart "awg-quick@${AWG_IFACE:-awg0}"
+    sleep 2
+    awg show "${AWG_IFACE:-awg0}" >/dev/null 2>&1 || die "Интерфейс не поднялся."
+    ok "MTU AmneziaWG: ${prev} -> ${m}"
+    warn "В клиентских конфигах MTU тоже надо поменять — заберите их заново:"
+    warn "  vpnctl links --qr"
+}
+
+# Скорость самого сервера, без туннеля. Отвечает на вопрос "тормозит канал
+# сервера или тормозит VPN".
+cmd_bench() {
+    hdr "Канал сервера (без туннеля)"
+    local url="https://speed.cloudflare.com/__down?bytes=52428800"
+    echo "  качаю 50 МБ..."
+    local r
+    r=$(timeout 90 curl -s -o /dev/null -w '%{speed_download} %{time_total}' --max-time 80 "$url" 2>/dev/null) || r=""
+    if [ -n "$r" ]; then
+        awk -v r="$r" 'BEGIN{split(r,a," "); printf "  скачано за %.1f с, скорость %.1f Мбит/с\n", a[2], a[1]*8/1000000}'
+    else
+        warn "  замерить не вышло (нет доступа к speed.cloudflare.com)"
+    fi
+
+    hdr "Ресурсы"
+    printf '  ядер CPU        : %s\n' "$(nproc 2>/dev/null)"
+    printf '  загрузка        : %s\n' "$(uptime | sed 's/.*load average: //')"
+    printf '  память          : %s\n' "$(free -h 2>/dev/null | awk '/Mem:/{print $3" из "$2}')"
+
+    hdr "AmneziaWG"
+    printf '  режим           : %s\n' "$( [ "${AWG_USE_KERNEL:-0}" = 1 ] && echo "модуль ядра (быстро)" || echo "userspace (медленно — vpnctl awg-kernel)" )"
+    printf '  MTU             : %s\n' "${AWG_MTU:-1420}"
+    if [ "${AWG_USE_KERNEL:-0}" != 1 ] && have amneziawg-go; then
+        printf '  CPU у amneziawg-go: %s%%\n' "$(ps -o %cpu= -C amneziawg-go 2>/dev/null | awk '{s+=$1} END{printf "%.1f", s}')"
+    fi
+
+    hdr "Ориентиры"
+    cat <<'NOTE'
+  Канал сервера быстрый, а через VPN медленно:
+    userspace-режим AmneziaWG      -> vpnctl awg-kernel
+    великоватый MTU                -> vpnctl set-mtu 1380, затем 1280
+    Hysteria рвётся                -> смотрите journalctl -u hysteria-server
+  Канал сервера сам по себе медленный -> вопрос к хостеру, VPN ни при чём.
+NOTE
+}
+
 # Смотрит на провод: доходит ли до сервера TLS-приветствие клиента вообще.
 # Единственный способ отличить "клиент ничего не шлёт" от "шлёт, но сервер не
 # разбирает" — посмотреть на сами пакеты.
@@ -835,6 +975,10 @@ case "${1:-}" in
     capture) shift; cmd_capture "${1:-}" "${2:-45}" ;;
     inspect) shift; bash "$VPNSTACK_DIR/inspect.sh" "${1:-}" ;;
     set-mss) shift; cmd_set_mss "${1:-}" ;;
+    set-mtu) shift; cmd_set_mtu "${1:-}" ;;
+    awg-kernel) cmd_awg_kernel ;;
+    awg-userspace) cmd_awg_userspace ;;
+    bench)   cmd_bench ;;
     debug)   shift; cmd_debug "${1:-}" ;;
     ""|-h|--help|help) usage ;;
     *) err "Неизвестная команда: $1"; usage; exit 1 ;;

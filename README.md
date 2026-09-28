@@ -116,6 +116,20 @@ curl -fsSL https://raw.githubusercontent.com/blessed2142/my_vpn_stack/claude/vpn
 
 Нужен, чтобы сравнить рабочую установку с нерабочей.
 
+### Скорость
+
+```
+vpnctl bench                 скорость канала сервера, режим AmneziaWG, нагрузка
+vpnctl awg-kernel            перевести AmneziaWG на модуль ядра
+vpnctl awg-userspace         вернуть userspace-реализацию
+vpnctl set-mtu <1000-1500>   MTU туннеля (типовые: 1420, 1380, 1280)
+```
+
+На Debian и Ubuntu без модуля ядра AmneziaWG работает через `amneziawg-go` —
+каждый пакет ходит в userspace, скорость заметно ниже, процессор греется.
+`vpnctl awg-kernel` ставит модуль из репозитория Amnezia (собирается dkms под
+ваше ядро) и переключает интерфейс на него. Клиентам менять ничего не нужно.
+
 ### Настройка на ходу
 
 ```
