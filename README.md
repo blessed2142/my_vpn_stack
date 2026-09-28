@@ -90,6 +90,15 @@ vpnctl info                 параметры сервера (SNI, ключи, 
 vpnctl regen                перегенерировать конфиги из состояния
 vpnctl restart              перезапустить все сервисы
 vpnctl tls-acme <домен> <email>   перевести Hysteria2 на Let's Encrypt
+vpnctl set-hy2-endpoint <домен|IP|off>  адрес сервера в ссылках Hysteria2
+vpnctl hy2-links [--qr]     только ссылки Hysteria2 всех клиентов
+```
+
+Если при установке DNS ещё не успел обновиться, в ссылках окажется IP.
+Перевести на домен одну Hysteria2, не трогая уже розданные конфиги AmneziaWG:
+
+```bash
+vpnctl set-hy2-endpoint vpn.example.com
 ```
 
 ### Диагностика
